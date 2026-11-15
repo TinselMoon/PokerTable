@@ -3,6 +3,7 @@ import threading
 import time
 import cv2
 import numpy as np
+from pathlib import Path
 
 # Configurações de ROI (x, y, largura, altura) para recortes no frame já orientado
 ROI_NUMERO = (179, 250, 79, 101)
@@ -145,12 +146,22 @@ def ler_comandos():
 
 
 def main():
+    BASE_DIR = Path(__file__).resolve().parent
+    PASTA_MODELOS = BASE_DIR / "modelos"
+
     try:
-        svm_valores = cv2.ml.SVM_load("modelos/modelo_valores.xml")
-        svm_vermelhos = cv2.ml.SVM_load("modelos/modelo_naipes_vermelhos.xml")
-        svm_pretos = cv2.ml.SVM_load("modelos/modelo_naipes_pretos.xml")
+        svm_valores = cv2.ml.SVM_load(str(PASTA_MODELOS / "modelo_valores.xml"))
+        svm_vermelhos = cv2.ml.SVM_load(
+            str(PASTA_MODELOS / "modelo_naipes_vermelhos.xml")
+        )
+        svm_pretos = cv2.ml.SVM_load(str(PASTA_MODELOS / "modelo_naipes_pretos.xml"))
+
+        if svm_valores.empty() or svm_vermelhos.empty() or svm_pretos.empty():
+            raise FileNotFoundError(
+                "Um ou mais arquivos XML não foram encontrados ou estão vazios."
+            )
     except Exception as e:
-        evento("ERRO;Nao foi possivel carregar os modelos XML. Rode na mesma pasta.")
+        evento(f"ERRO;Falha ao carregar modelos XML em {PASTA_MODELOS}: {e}")
         return 1
 
     led = Led(17)
