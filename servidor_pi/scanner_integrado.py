@@ -146,9 +146,9 @@ def ler_comandos():
 
 def main():
     try:
-        svm_valores = cv2.ml.SVM_load("modelo_valores.xml")
-        svm_vermelhos = cv2.ml.SVM_load("modelo_naipes_vermelhos.xml")
-        svm_pretos = cv2.ml.SVM_load("modelo_naipes_pretos.xml")
+        svm_valores = cv2.ml.SVM_load("modelos/modelo_valores.xml")
+        svm_vermelhos = cv2.ml.SVM_load("modelos/modelo_naipes_vermelhos.xml")
+        svm_pretos = cv2.ml.SVM_load("modelos/modelo_naipes_pretos.xml")
     except Exception as e:
         evento("ERRO;Nao foi possivel carregar os modelos XML. Rode na mesma pasta.")
         return 1
