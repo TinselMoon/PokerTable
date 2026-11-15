@@ -1,0 +1,23 @@
+version = 1
+revision = 3
+requires-python = ">=3.12"
+
+[[package]]
+name = "pokertable"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "treys" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "treys", specifier = ">=0.1.8" }]
+
+[[package]]
+name = "treys"
+version = "0.1.8"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/3b/a6/1712340dc1ac96d40afe162d43ce146c7781ba59cde5efc988aaee35ada4/treys-0.1.8.tar.gz", hash = "sha256:a486a42b899e91985b4da4fdac9a30e638275648977104487acb90a2dd7cd73b", size = 12073, upload-time = "2022-06-21T16:02:44.976Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/46/df/e6b3b1cc98c3e00c5b146113f998dfe0de47358277648df235a6ae571143/treys-0.1.8-py3-none-any.whl", hash = "sha256:9ba3460ff2ed597510fb535af6280f115254b0b70699ea362f8f1ee067378063", size = 11897, upload-time = "2022-06-21T16:02:42.896Z" },
+]
