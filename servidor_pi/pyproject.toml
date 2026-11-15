@@ -7,3 +7,6 @@ dependencies = [
     "numpy",
     "treys",
 ]
+
+[tool.uv]
+system-site-packages = true
