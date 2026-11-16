@@ -36,16 +36,22 @@ class HardwareScanner:
         try:
             self.led = DigitalOutputDevice(pino_led, initial_value=False)
             self.vcc_ir = DigitalOutputDevice(pino_vcc_ir, initial_value=False)
-            self.sensor_ir = DigitalInputDevice(pino_do_ir, pull_up=True)
+            # pull_up=None evita conflito com o circuito do módulo IR.
+            # Se a lógica estiver invertida, troque active_state=True para active_state=False
+            self.sensor_ir = DigitalInputDevice(
+                pino_do_ir, pull_up=None, active_state=True
+            )
             self.ativo = True
+            log("GPIO iniciado com sucesso (Pinos BCM 17, 27, 22).")
         except Exception as e:
-            log(f"Hardware GPIO indisponível ({e}); seguindo sem LED/IR.")
+            log(f"ERRO GPIO: {e}")
 
     def ligar(self):
         if self.ativo:
             self.led.on()
             self.vcc_ir.on()
-            time.sleep(0.05)  # Estabiliza o sensor IR
+            time.sleep(0.05)
+            log("LED e VCC do Infravermelho LIGADOS.")
 
     def desligar(self):
         if self.ativo:
@@ -55,7 +61,7 @@ class HardwareScanner:
     @property
     def carta_no_sensor(self) -> bool:
         if not self.ativo:
-            return True  # Fallback caso rode sem GPIO conectado
+            return True
         return self.sensor_ir.is_active
 
     def fechar(self):
