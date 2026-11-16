@@ -13,5 +13,3 @@ product = "PokerTable"
 [tool.flet.app]
 path = "src"
 
-[tool.flet.android.manifest]
-<intent><action android:name="android.intent.action.TTS_SERVICE" /></intent>
