@@ -56,7 +56,7 @@ class HardwareScanner:
     def carta_no_sensor(self) -> bool:
         if not self.ativo:
             return True  # Fallback caso rode sem GPIO conectado
-        return not self.sensor_ir.is_active
+        return self.sensor_ir.is_active
 
     def fechar(self):
         if self.ativo:
