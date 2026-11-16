@@ -22,6 +22,7 @@ def main(page: ft.Page):
 
     sock_cliente = None
     conectado = False
+    partida_iniciada = False
 
     # =========================================================================
     # TELA 1: CONEXÃO E CADASTRO DO JOGADOR
@@ -70,7 +71,7 @@ def main(page: ft.Page):
         "Pote: R$ 0", size=16, weight=ft.FontWeight.BOLD, color=ft.Colors.GREEN_300
     )
     txt_turno = ft.Text("Vez de: -", size=15, weight=ft.FontWeight.BOLD)
-    txt_info = ft.Text("Aguardando início da rodada...", size=14)
+    txt_info = ft.Text("Clique em 'Iniciar Partida' para começar.", size=14)
 
     row_mao = ft.Row(spacing=10)
     row_mesa = ft.Row(spacing=8, wrap=True)
@@ -82,17 +83,21 @@ def main(page: ft.Page):
     )
 
     def ir_para_tela_mesa(nome: str, saldo: float, ip: str, porta: int):
+        nonlocal partida_iniciada
+        partida_iniciada = False
         box_notificacao.visible = False
         tag_teste = " [VS ROBÔ]" if switch_testes.value else ""
         txt_jogador_header.value = f"{nome}{tag_teste} • {ip}:{porta}"
         txt_saldo.value = f"Saldo: R$ {saldo:.0f}"
+        atualizar_botao_partida()
         tela_conexao.visible = False
         tela_mesa.visible = True
         page.update()
 
     def voltar_para_conexao(motivo: str = ""):
-        nonlocal conectado, sock_cliente
+        nonlocal conectado, sock_cliente, partida_iniciada
         conectado = False
+        partida_iniciada = False
         if sock_cliente:
             try:
                 sock_cliente.close()
@@ -119,7 +124,7 @@ def main(page: ft.Page):
                 voltar_para_conexao(f"Conexão perdida com o servidor: {ex}")
 
     def criar_carta_ui(codigo: str):
-        """Converte '8c' -> '8 ♣' e 'Th' -> '10 ♥' em carta branca com naipe colorido."""
+        """Converte '8c' -> '8 ♣' e 'Th' -> '10 ♥'."""
         if len(codigo) >= 2:
             valor_bruto = codigo[:-1]
             letra_naipe = codigo[-1].lower()
@@ -140,13 +145,34 @@ def main(page: ft.Page):
                 weight=ft.FontWeight.BOLD,
                 color=cor_texto,
             ),
-            padding=ft.Padding.symmetric(horizontal=14, vertical=12),
+            padding=12,
             bgcolor=ft.Colors.WHITE,
             border_radius=8,
         )
 
+    def atualizar_botao_partida():
+        if partida_iniciada:
+            btn_controle_partida.content = "Reiniciar Mesa"
+            btn_controle_partida.bgcolor = ft.Colors.ORANGE_800
+        else:
+            btn_controle_partida.content = "Iniciar Partida"
+            btn_controle_partida.bgcolor = ft.Colors.GREEN_700
+
+    def on_clique_controle_partida(e):
+        if partida_iniciada:
+            enviar_comando("reiniciar_mesa")
+        else:
+            enviar_comando("iniciar_partida", modo_testes=switch_testes.value)
+
     def on_estado_mesa(dados: dict):
-        txt_fase.value = f"Fase: {dados.get('fase', '-')}"
+        nonlocal partida_iniciada
+        partida_iniciada = dados.get("partida_iniciada", False)
+        fase = dados.get("fase", "-")
+        atualizar_botao_partida()
+
+        btn_proxima_mao.visible = fase == "SHOWDOWN"
+
+        txt_fase.value = f"Fase: {fase}"
         txt_pote.value = f"Pote: R$ {dados.get('pote', 0):.0f}"
         txt_saldo.value = f"Saldo: R$ {dados.get('seu_saldo', 0):.0f}"
         txt_info.value = dados.get("msg", "")
@@ -167,7 +193,7 @@ def main(page: ft.Page):
             f"Pagar R${a_pagar:.0f}" if a_pagar > 0 else "Passar (Check)"
         )
 
-    def on_nova_rodada(dados: dict):
+    def on_limpar_mesa(dados: dict):
         row_mao.controls.clear()
         row_mesa.controls.clear()
 
@@ -179,7 +205,7 @@ def main(page: ft.Page):
         "carta_mesa": lambda d: row_mesa.controls.append(
             criar_carta_ui(d.get("carta", "?"))
         ),
-        "nova_rodada": on_nova_rodada,
+        "limpar_mesa": on_limpar_mesa,
         "erro": lambda d: setattr(txt_info, "value", f"Aviso: {d.get('msg', '')}"),
     }
 
@@ -203,7 +229,7 @@ def main(page: ft.Page):
                             handler(dados)
                             page.update()
                     except Exception as ui_err:
-                        txt_info.value = f"Erro ao renderizar pacote: {ui_err}"
+                        txt_info.value = f"Erro de interface: {ui_err}"
                         page.update()
         except Exception as net_err:
             if conectado:
@@ -289,10 +315,17 @@ def main(page: ft.Page):
         expand=True,
         on_click=conectar,
     )
-    btn_nova_rodada = ft.OutlinedButton(
-        "Nova Rodada",
+    btn_controle_partida = ft.Button(
+        "Iniciar Partida",
+        bgcolor=ft.Colors.GREEN_700,
+        color=ft.Colors.WHITE,
+        on_click=on_clique_controle_partida,
+    )
+    btn_proxima_mao = ft.OutlinedButton(
+        "Próxima Mão",
+        visible=False,
         on_click=lambda e: enviar_comando(
-            "iniciar_rodada", modo_testes=switch_testes.value
+            "iniciar_partida", modo_testes=switch_testes.value
         ),
     )
     btn_sair = ft.OutlinedButton(
@@ -347,7 +380,7 @@ def main(page: ft.Page):
                 alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
             ),
             ft.Row(
-                [txt_fase, btn_nova_rodada],
+                [txt_fase, ft.Row([btn_proxima_mao, btn_controle_partida], spacing=8)],
                 alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
             ),
             ft.Row(
