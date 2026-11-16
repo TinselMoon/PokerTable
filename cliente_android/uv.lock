@@ -177,10 +177,44 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "flet" },
+    { name = "pyjnius" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "flet" }]
+requires-dist = [
+    { name = "flet" },
+    { name = "pyjnius", specifier = ">=1.9.0" },
+]
+
+[[package]]
+name = "pyjnius"
+version = "1.9.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/95/17/a241fdb4ab3316d6d342bc6338293095b14a9f117a023da63424acef1f62/pyjnius-1.9.0.tar.gz", hash = "sha256:038511848c8a4c6a85b8788274b7eec4b2c78ecd5651cd05b8ea864a42c22d64", size = 75938, upload-time = "2026-10-10T21:04:04.133Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c7/ab/c3f46aea67953234f109d89b27886348d843506a35adc3ce69ac450b7a51/pyjnius-1.9.0-cp312-cp312-macosx_10_13_universal2.whl", hash = "sha256:e02faf8bf9290a48d8d1c7b8b9ce18ace215622cc1b2ee6541827081e695e1a7", size = 494218, upload-time = "2026-10-10T21:03:40.872Z" },
+    { url = "https://files.pythonhosted.org/packages/f0/0b/45efdd394f898cb44102972df45806990432716cbd130d3e62ea5f404886/pyjnius-1.9.0-cp312-cp312-macosx_10_13_x86_64.whl", hash = "sha256:d3906e318b32f6bfa761ff594de6c1126f3336cf752fb201adbee4d274adecf9", size = 262083, upload-time = "2026-10-10T21:03:42.21Z" },
+    { url = "https://files.pythonhosted.org/packages/47/75/ef3ab1fcd881350ff9df9397e0e3791b94af3bc3d8c20c9590816e8fb201/pyjnius-1.9.0-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:8c34704dbf60c58cd98a7dd21c37eff3d70d7c4b2a3b2c406089e998e40f1205", size = 1695815, upload-time = "2026-10-10T21:03:43.393Z" },
+    { url = "https://files.pythonhosted.org/packages/8e/0b/9bbf62e0f2e691018805469a8dc81a631d4c06385100eb14fda9b859a906/pyjnius-1.9.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:0870f444cfa2589950344b5b23c8c5769c86303029462ec50059dd2b78cfe15d", size = 1743333, upload-time = "2026-10-10T21:03:44.66Z" },
+    { url = "https://files.pythonhosted.org/packages/b0/c9/f0d9f463a0c4905e5c380fb2e1750117ceedf57c306436f5c5542be5e4d7/pyjnius-1.9.0-cp312-cp312-win32.whl", hash = "sha256:abdcd69604bbc26e2b0f4318753ac16304182ced96ee880d81e4ca3050f00e8b", size = 184835, upload-time = "2026-10-10T21:03:46.192Z" },
+    { url = "https://files.pythonhosted.org/packages/1b/d2/232a3cd027163015c85d545ece4288d2e24a0b0d1f1c823d65c1f233926a/pyjnius-1.9.0-cp312-cp312-win_amd64.whl", hash = "sha256:296c610a6beab6a08d801cf3337bef94746816252c6a997db218a80d900ab67a", size = 223000, upload-time = "2026-10-10T21:03:47.34Z" },
+    { url = "https://files.pythonhosted.org/packages/89/ca/de2535af0c1d850c87ffef535821df7ce36f32bedd97f6265b96d277b203/pyjnius-1.9.0-cp313-cp313-android_24_arm64_v8a.whl", hash = "sha256:c216e96fb68404618977c3a5010c65a8d46abcb2e335eebec32bcc2a97ec7d5f", size = 218771, upload-time = "2026-10-10T21:00:22.675Z" },
+    { url = "https://files.pythonhosted.org/packages/03/12/4d1860f244b19b063fc2730dc003ab987180cb3f293adb71f01c624707a2/pyjnius-1.9.0-cp313-cp313-android_24_x86_64.whl", hash = "sha256:186d29ca713b9c753f782abf22c1e5016c7263897a62d3efa098c18378f1368f", size = 234005, upload-time = "2026-10-10T21:00:24.605Z" },
+    { url = "https://files.pythonhosted.org/packages/6e/5d/6cb48cbe3cd7186fd21a60a6516338910f16181c8ad21e7c313c03abcccc/pyjnius-1.9.0-cp313-cp313-macosx_10_13_universal2.whl", hash = "sha256:f91244a9ce22bc05d43ebcd04ffeb376d5d00057ab623973a294507adb046b6e", size = 494155, upload-time = "2026-10-10T21:03:48.776Z" },
+    { url = "https://files.pythonhosted.org/packages/c1/9e/d9f6fc24ca1d89f7be4f4cdee8a2b0531c1820dd682a3c5fff6458dc14a0/pyjnius-1.9.0-cp313-cp313-macosx_10_13_x86_64.whl", hash = "sha256:b50b4f767ab37266fe92137052defb62cb60f563ac50150bcb5a14045c5630d0", size = 262456, upload-time = "2026-10-10T21:03:49.888Z" },
+    { url = "https://files.pythonhosted.org/packages/cb/8f/9b24dffc00dcfa38dd9e66dfd70d3cb92d1ce897d3526a8d38643ff8205c/pyjnius-1.9.0-cp313-cp313-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:8ec82c093ada2c0ad10c6aa0cfd30ff7d01df3c558100bfa1ab4fa224900f9ef", size = 1688933, upload-time = "2026-10-10T21:03:51.047Z" },
+    { url = "https://files.pythonhosted.org/packages/9d/19/2ce329bbbfe4f33bd92be7a78d5248418f5dc9bc7134d3190e67607c7102/pyjnius-1.9.0-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:7f06dd36fede18bf744848b3ed262af5e478fe4e789bcded114e487ce6e2bb6f", size = 1733508, upload-time = "2026-10-10T21:03:52.319Z" },
+    { url = "https://files.pythonhosted.org/packages/c6/87/012318ad2275c76c1e3e4f953b664149afe1b65d3df649dfadc63fae8295/pyjnius-1.9.0-cp313-cp313-win32.whl", hash = "sha256:2dc0a949f35522ae8710ab6871847912afc7e70f8cdcbc2f177c41cf9bf978da", size = 184545, upload-time = "2026-10-10T21:03:53.584Z" },
+    { url = "https://files.pythonhosted.org/packages/87/35/84ff1aa696a251a9e1fe5e684db49526dd75254fe8f7a56ab4c2d770cefa/pyjnius-1.9.0-cp313-cp313-win_amd64.whl", hash = "sha256:bde3e936b3befa123fceecf0c38ca8844235a81fd2619f35d4e935d4c8d21f61", size = 222711, upload-time = "2026-10-10T21:03:54.588Z" },
+    { url = "https://files.pythonhosted.org/packages/2b/44/f69a886b8071e9c4f53137a14af39d63c0e312c1412997fd13d3954626d7/pyjnius-1.9.0-cp314-cp314-android_24_arm64_v8a.whl", hash = "sha256:b75c19dec33cf7b255333b3b447dc2e3a55d8da1e695445f8cdba307df5e7e68", size = 220851, upload-time = "2026-10-10T21:00:26.143Z" },
+    { url = "https://files.pythonhosted.org/packages/9b/bd/e558125ef40e04f3032a7c4c9b32a08b963c757140f61cfd6c938be8bc01/pyjnius-1.9.0-cp314-cp314-android_24_x86_64.whl", hash = "sha256:529ad706eba5684008b2d028c41c4e77e24ffae49631afd0e886b04f3f2f2a17", size = 234439, upload-time = "2026-10-10T21:00:27.422Z" },
+    { url = "https://files.pythonhosted.org/packages/6f/37/8191a3d43943d1c4e0b4b58112725f38511309935d46146e25b01040d4e3/pyjnius-1.9.0-cp314-cp314-macosx_10_15_universal2.whl", hash = "sha256:8f41b8cc08def74a35213f791eeba46ebea89349c0fd72c02f44253043d08366", size = 503187, upload-time = "2026-10-10T21:03:55.729Z" },
+    { url = "https://files.pythonhosted.org/packages/fa/b5/23787b5fb854b70fe2cdd918b2d4ef982edb7d5d051471c2d8d586cee15e/pyjnius-1.9.0-cp314-cp314-macosx_10_15_x86_64.whl", hash = "sha256:0830f5a7c27dd29e4a9868507918c2c1b456b4dea823de5fa25d6d49d080fabe", size = 264635, upload-time = "2026-10-10T21:03:57.189Z" },
+    { url = "https://files.pythonhosted.org/packages/85/8a/6421713635d3d5c8746d020fd788f7ddf4c3164db88bb752ed9e390386a6/pyjnius-1.9.0-cp314-cp314-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:adf7e01f8ab54d53a752d0873e30bcc13afd1c2af1484db8f9f99ed6f595a226", size = 1689605, upload-time = "2026-10-10T21:03:58.344Z" },
+    { url = "https://files.pythonhosted.org/packages/86/2b/c689f283de862f3fe6b079fbe4508c5871baa1998a6148588cd33a7957c0/pyjnius-1.9.0-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:596e374376062d21ec910ee9db7e480b382735c2ab0b0e761920e5d31d87cf56", size = 1715476, upload-time = "2026-10-10T21:03:59.993Z" },
+    { url = "https://files.pythonhosted.org/packages/7c/f6/0aaa5bd3ead472bf24aa951cba6e8d84ec659b79504943138f839644fa25/pyjnius-1.9.0-cp314-cp314-win32.whl", hash = "sha256:e3e7c4d3de51e181ef3782932f186c910a05a871f3026850824e1e2caa61715c", size = 188535, upload-time = "2026-10-10T21:04:01.981Z" },
+    { url = "https://files.pythonhosted.org/packages/b4/e5/141da26601fdbb3300a7ef8f9d0bfa5492bcef7a79a1fc5b3effd4d6f76e/pyjnius-1.9.0-cp314-cp314-win_amd64.whl", hash = "sha256:ea8a1e77e0b35ea935a3d0dcd8e96790d69580482c17dbdbbc3c75f58196612a", size = 228767, upload-time = "2026-10-10T21:04:03.075Z" },
+]
 
 [[package]]
 name = "repath"

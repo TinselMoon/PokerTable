@@ -1,3 +1,4 @@
+import re
 import socket
 import threading
 from itertools import combinations
@@ -14,14 +15,171 @@ ICONES_NAIPE = {
     "c": "♣",
 }
 
+NOMES_VALORES_TTS = {
+    "A": "Ás",
+    "2": "Dois",
+    "3": "Três",
+    "4": "Quatro",
+    "5": "Cinco",
+    "6": "Seis",
+    "7": "Sete",
+    "8": "Oito",
+    "9": "Nove",
+    "T": "Dez",
+    "10": "Dez",
+    "J": "Valete",
+    "Q": "Dama",
+    "K": "Rei",
+}
+
+NOMES_NAIPES_TTS = {
+    "h": "Copas",
+    "d": "Ouros",
+    "s": "Espadas",
+    "c": "Paus",
+}
+
 VALORES_MAP = {
-    "2": 2, "3": 3, "4": 4, "5": 5, "6": 6, "7": 7, "8": 8,
-    "9": 9, "T": 10, "J": 11, "Q": 12, "K": 13, "A": 14,
+    "2": 2,
+    "3": 3,
+    "4": 4,
+    "5": 5,
+    "6": 6,
+    "7": 7,
+    "8": 8,
+    "9": 9,
+    "T": 10,
+    "J": 11,
+    "Q": 12,
+    "K": 13,
+    "A": 14,
 }
 NOMES_COMBINACOES = [
-    "Carta Alta", "Um Par", "Dois Pares", "Trinca", "Sequência",
-    "Flush", "Full House", "Quadra", "Straight Flush",
+    "Carta Alta",
+    "Um Par",
+    "Dois Pares",
+    "Trinca",
+    "Sequência",
+    "Flush",
+    "Full House",
+    "Quadra",
+    "Straight Flush",
 ]
+
+
+class AndroidTTS:
+    """Wrapper para o Text-to-Speech nativo do Android via Pyjnius."""
+
+    def __init__(self):
+        self.ativo = True
+        self._tts = None
+        self._idioma_configurado = False
+        self._queue_add = 1
+        self._queue_flush = 0
+        self._utterance_id = 0
+        self._lock = threading.Lock()
+        self._inicializar_android()
+
+    def _inicializar_android(self):
+        try:
+            from jnius import autoclass
+
+            ActivityThread = autoclass("android.app.ActivityThread")
+            TextToSpeech = autoclass("android.speech.tts.TextToSpeech")
+
+            app = ActivityThread.currentApplication()
+            if app is None:
+                return
+            context = app.getApplicationContext()
+
+            self._queue_add = TextToSpeech.QUEUE_ADD
+            self._queue_flush = TextToSpeech.QUEUE_FLUSH
+            self._tts = TextToSpeech(context, None)
+            self._garantir_idioma()
+        except Exception as e:
+            print(f"[TTS] Modo desktop/fallback: {e}")
+            self._tts = None
+
+    def _garantir_idioma(self):
+        if self._tts is not None and not self._idioma_configurado:
+            try:
+                from jnius import autoclass
+
+                Locale = autoclass("java.util.Locale")
+                res = self._tts.setLanguage(Locale("pt", "BR"))
+                if res >= 0:
+                    self._idioma_configurado = True
+            except Exception:
+                pass
+
+    def falar(self, texto: str, interromper: bool = False):
+        texto = texto.strip()
+        if not texto or not self.ativo:
+            return
+
+        with self._lock:
+            self._utterance_id += 1
+            uid = f"poker_tts_{self._utterance_id}"
+
+        if self._tts is not None:
+            try:
+                self._garantir_idioma()
+                modo = self._queue_flush if interromper else self._queue_add
+                self._tts.speak(texto, modo, None, uid)
+            except Exception as e:
+                print(f"[TTS] Erro ao falar: {e}")
+        else:
+            print(f"[TTS] {texto}")
+
+    def parar(self):
+        if self._tts is not None:
+            try:
+                self._tts.stop()
+            except Exception:
+                pass
+
+
+def carta_para_texto_tts(codigo: str) -> str:
+    if len(codigo) < 2:
+        return codigo
+    valor = NOMES_VALORES_TTS.get(codigo[:-1].upper(), codigo[:-1])
+    naipe = NOMES_NAIPES_TTS.get(codigo[-1].lower(), "")
+    return f"{valor} de {naipe}" if naipe else valor
+
+
+def formatar_acao_para_tts(msg: str) -> str | None:
+    """Filtra eventos de jogo e adapta o texto para pronúncia natural em português."""
+    if not msg:
+        return None
+
+    palavras_chave = (
+        "correu",
+        "passou",
+        "pagou",
+        "aumentou",
+        "ALL-IN",
+        "ganhou",
+        "SHOWDOWN",
+        "Blinds:",
+        "Flop virado",
+        "Turn virado",
+        "River virado",
+        "Rebuy",
+        "conectou",
+        "entrou",
+        "saiu",
+        "desconectou",
+    )
+    if not any(k in msg for k in palavras_chave):
+        return None
+
+    texto = msg
+    for termo in (" (Fold)", " (Check)", " (Call)", " (Raise)"):
+        texto = texto.replace(termo, "")
+    texto = texto.replace("ALL-IN", "all-in").replace("SHOWDOWN!", "Showdown!")
+    texto = texto.replace("(SB ", "(small blind ").replace("(BB ", "(big blind ")
+    texto = re.sub(r"R\$\s*(\d+(?:[.,]\d+)?)", r"\1 reais", texto)
+    return texto
 
 
 def fmt_valor(v: float) -> str:
@@ -33,9 +191,9 @@ def _avaliar_5(cinco: tuple[str, ...]) -> tuple[int, list[int]]:
     valores = sorted([VALORES_MAP[c[0].upper()] for c in cinco], reverse=True)
     naipes = [c[1].lower() for c in cinco]
     eh_flush = len(set(naipes)) == 1
-    eh_straight = (
-        valores == list(range(valores[0], valores[0] - 5, -1))
-    ) or (valores == [14, 5, 4, 3, 2])
+    eh_straight = (valores == list(range(valores[0], valores[0] - 5, -1))) or (
+        valores == [14, 5, 4, 3, 2]
+    )
     if valores == [14, 5, 4, 3, 2]:
         valores = [5, 4, 3, 2, 1]
 
@@ -63,9 +221,7 @@ def _avaliar_5(cinco: tuple[str, ...]) -> tuple[int, list[int]]:
 
 
 def descobrir_combinacao(mao: list[str], mesa: list[str]) -> str:
-    todas = [
-        c for c in (mao + mesa) if len(c) >= 2 and c[0].upper() in VALORES_MAP
-    ]
+    todas = [c for c in (mao + mesa) if len(c) >= 2 and c[0].upper() in VALORES_MAP]
     if not todas:
         return "Aguardando cartas..."
     if len(todas) < 5:
@@ -90,8 +246,10 @@ def main(page: ft.Page):
     page.padding = 16
     page.scroll = ft.ScrollMode.AUTO
 
+    tts = AndroidTTS()
     sock_cliente = None
     conectado = False
+    ultima_msg_falada = ""
     cartas_mao_codigos: list[str] = []
     cartas_mesa_codigos: list[str] = []
 
@@ -130,7 +288,9 @@ def main(page: ft.Page):
     # TELA 2: MESA DE POKER E AÇÕES DO JOGADOR
     # =========================================================================
     txt_jogador_header = ft.Text("", size=14, color=ft.Colors.GREY_400)
-    txt_papel = ft.Text("", size=13, weight=ft.FontWeight.BOLD, color=ft.Colors.CYAN_300)
+    txt_papel = ft.Text(
+        "", size=13, weight=ft.FontWeight.BOLD, color=ft.Colors.CYAN_300
+    )
     txt_fase = ft.Text("Fase: AGUARDANDO", weight=ft.FontWeight.BOLD)
     txt_saldo = ft.Text(
         "Saldo: R$ 0", size=16, weight=ft.FontWeight.BOLD, color=ft.Colors.AMBER_300
@@ -147,6 +307,15 @@ def main(page: ft.Page):
     )
     txt_info = ft.Text("Aguardando o servidor iniciar a partida...", size=14)
 
+    def alternar_audio(_e):
+        tts.ativo = not tts.ativo
+        if not tts.ativo:
+            tts.parar()
+        btn_audio.text = "Áudio: ON" if tts.ativo else "Áudio: OFF"
+        page.update()
+
+    btn_audio = ft.OutlinedButton("Áudio: ON", on_click=alternar_audio)
+
     row_mao = ft.Row(spacing=10)
     row_mesa = ft.Row(spacing=8, wrap=True)
     input_raise = ft.TextField(
@@ -156,7 +325,6 @@ def main(page: ft.Page):
         keyboard_type=ft.KeyboardType.NUMBER,
     )
 
-    # Painel de Rebuy (aparece entre rodadas ou se estiver fora da mão)
     input_rebuy = ft.TextField(
         label="Valor Rebuy (R$)",
         value="500",
@@ -206,8 +374,10 @@ def main(page: ft.Page):
         mostrar_tela("MESA")
 
     def voltar_para_conexao(motivo: str = ""):
-        nonlocal conectado, sock_cliente
+        nonlocal conectado, sock_cliente, ultima_msg_falada
         conectado = False
+        ultima_msg_falada = ""
+        tts.parar()
         if sock_cliente:
             try:
                 sock_cliente.close()
@@ -260,11 +430,10 @@ def main(page: ft.Page):
         )
 
     def atualizar_combinacao():
-        txt_combinacao.value = (
-            f"Jogo Atual: {descobrir_combinacao(cartas_mao_codigos, cartas_mesa_codigos)}"
-        )
+        txt_combinacao.value = f"Jogo Atual: {descobrir_combinacao(cartas_mao_codigos, cartas_mesa_codigos)}"
 
     def on_estado_mesa(dados: dict):
+        nonlocal ultima_msg_falada
         fase = dados.get("fase", "-")
         if fase != "PLACAR_FINAL" and tela_placar.visible:
             tela_placar.visible = False
@@ -280,7 +449,14 @@ def main(page: ft.Page):
         )
         saldo = dados.get("seu_saldo", 0.0)
         txt_saldo.value = f"Saldo: R$ {fmt_valor(saldo)}"
-        txt_info.value = dados.get("msg", "")
+
+        msg = dados.get("msg", "")
+        txt_info.value = msg
+        if msg and msg != ultima_msg_falada:
+            ultima_msg_falada = msg
+            fala = formatar_acao_para_tts(msg)
+            if fala:
+                tts.falar(fala)
 
         papel = dados.get("papel", "")
         em_espera = dados.get("em_espera", False)
@@ -310,10 +486,11 @@ def main(page: ft.Page):
             f"Pagar R${fmt_valor(a_pagar)}" if a_pagar > 0 else "Passar (Check)"
         )
 
-        # Mostra painel de rebuy se permitido (entre rodadas ou fora da mão)
         box_rebuy.visible = bool(dados.get("pode_rebuy", False))
 
     def on_limpar_mesa(_dados: dict):
+        nonlocal ultima_msg_falada
+        ultima_msg_falada = ""
         cartas_mao_codigos.clear()
         cartas_mesa_codigos.clear()
         row_mao.controls.clear()
@@ -325,12 +502,14 @@ def main(page: ft.Page):
         cartas_mao_codigos.append(codigo)
         row_mao.controls.append(criar_carta_ui(codigo))
         atualizar_combinacao()
+        tts.falar(f"Sua carta: {carta_para_texto_tts(codigo)}")
 
     def on_carta_mesa(dados: dict):
         codigo = dados.get("carta", "?")
         cartas_mesa_codigos.append(codigo)
         row_mesa.controls.append(criar_carta_ui(codigo))
         atualizar_combinacao()
+        tts.falar(f"Carta na mesa: {carta_para_texto_tts(codigo)}")
 
     def on_placar_final(dados: dict):
         ranking = dados.get("ranking", [])
@@ -494,9 +673,7 @@ def main(page: ft.Page):
         try:
             val = float(input_rebuy.value.replace(",", "."))
             if val < SALDO_MIN or val > SALDO_MAX:
-                txt_info.value = (
-                    f"Rebuy deve ser entre R$ {fmt_valor(SALDO_MIN)} e R$ {fmt_valor(SALDO_MAX)}."
-                )
+                txt_info.value = f"Rebuy deve ser entre R$ {fmt_valor(SALDO_MIN)} e R$ {fmt_valor(SALDO_MAX)}."
                 page.update()
                 return
             enviar_comando("rebuy", valor=val)
@@ -504,7 +681,6 @@ def main(page: ft.Page):
             txt_info.value = "Digite um valor numérico válido para o Rebuy."
             page.update()
 
-    # Botões
     btn_conectar = ft.Button(
         "Entrar na Mesa",
         bgcolor=ft.Colors.GREEN_700,
@@ -545,7 +721,6 @@ def main(page: ft.Page):
         on_click=lambda e: enviar_comando("acao", acao="all_in"),
     )
 
-    # Montagem das 3 telas
     tela_conexao = ft.Column(
         visible=True,
         spacing=14,
@@ -565,7 +740,7 @@ def main(page: ft.Page):
         spacing=10,
         controls=[
             ft.Row(
-                [txt_jogador_header, btn_sair],
+                [txt_jogador_header, ft.Row([btn_audio, btn_sair], spacing=6)],
                 alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
             ),
             txt_papel,

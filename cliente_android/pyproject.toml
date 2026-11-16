@@ -1,7 +1,10 @@
 [project]
 name = "pokertable"
 version = "0.1.0"
-dependencies = ["flet"]
+dependencies = [
+    "flet",
+    "pyjnius>=1.9.0",
+]
 
 [tool.flet]
 org = "com.poker"
@@ -9,3 +12,6 @@ product = "PokerTable"
 
 [tool.flet.app]
 path = "src"
+
+[tool.flet.android.manifest]
+<intent><action android:name="android.intent.action.TTS_SERVICE" /></intent>
