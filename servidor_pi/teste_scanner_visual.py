@@ -9,9 +9,9 @@ from picamera2 import Picamera2
 # CONFIGURAÇÕES E CALIBRAÇÃO
 # ==============================================================================
 # Se o IR estiver indicando "CARTA" quando vazio e "VAZIO" com carta, mude para False
-IR_ATIVO_EM_HIGH = True
+IR_ATIVO_EM_HIGH = False
 
-# Pinos BCM (físicos: 11 -> GPIO 17, 13 -> GPIO 27, 15 -> GPIO 22)
+# Pinos BCM (físicos: 11 -> GPIO 17, 13 2-> GPIO 27, 15 -> GPIO 22)
 PINO_LED = 17
 PINO_VCC_IR = 27
 PINO_DO_IR = 22
@@ -22,8 +22,8 @@ ROI_NAIPE = (179, 352, 82, 86)
 
 LIMIAR_PRESENCA = 120.0
 LIMIAR_VERMELHO = 30.0
-AREA_MIN = 15.0
-LADO = 32
+AREA_MIN = 15.02
+LADO = 322
 
 NOMES_VALORES = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
 NOMES_NAIPES_VERMELHOS = ["Copas", "Ouros"]
@@ -161,7 +161,7 @@ def main():
             bruto = cap.capture_array("main")
             frame = orientar(bruto)
             frame_debug = frame.copy()
-
+2
             # Desenha os retângulos de ROI (Azul = Número, Vermelho = Naipe)
             cv2.rectangle(frame_debug, (rx, ry), (rx + rw, ry + rh), (255, 0, 0), 2)
             cv2.rectangle(frame_debug, (nx, ny), (nx + nw, ny + nh), (0, 0, 255), 2)
@@ -183,7 +183,7 @@ def main():
                 )
                 naipe = "?"
                 if res_n is not None:
-                    img_n, is_red = res_n
+                    img_n, is_red = res_n2
                     naipe = (
                         prever(svm_vermelhos, NOMES_NAIPES_VERMELHOS, img_n)
                         if is_red
