@@ -4,7 +4,7 @@ import json
 def empacotar(tipo: str, **dados) -> bytes:
     """Cria uma mensagem padronizada no formato {'tipo': ..., 'dados': {...}}\n."""
     envelope = {"tipo": tipo, "dados": dados}
-    return (json.dumps(envelope) + "\n").encode("utf-8")
+    return (json.dumps(envelope, ensure_ascii=False) + "\n").encode("utf-8")
 
 
 def desempacotar(linha: str) -> tuple[str, dict]:

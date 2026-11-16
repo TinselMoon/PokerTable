@@ -9,7 +9,6 @@ from gpiozero import DigitalInputDevice, DigitalOutputDevice
 # ==============================================================================
 # CONFIGURAÇÕES DE HARDWARE E CALIBRAÇÃO
 # ==============================================================================
-# Ajuste para False se o seu sensor IR operar em lógica invertida
 IR_ATIVO_EM_HIGH = False
 
 # Pinos BCM (físicos: 11 -> GPIO 17, 13 -> GPIO 27, 15 -> GPIO 22)
@@ -17,11 +16,9 @@ PINO_LED = 17
 PINO_VCC_IR = 27
 PINO_DO_IR = 22
 
-# Parâmetros de estabilidade e consenso de leitura
-TEMPO_ESTABILIZACAO = 0.40  # Aguarda 400ms após o IR detectar antes de ler
-VOTOS_NECESSARIOS = 7  # Quantos frames idênticos seguidos para confirmar
+TEMPO_ESTABILIZACAO = 0.40
+VOTOS_NECESSARIOS = 7
 
-# Configurações de ROI (x, y, largura, altura) e visão computacional
 ROI_NUMERO = (179, 250, 79, 101)
 ROI_NAIPE = (179, 352, 82, 86)
 
@@ -34,17 +31,29 @@ NOMES_VALORES = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K
 NOMES_NAIPES_VERMELHOS = ["Copas", "Ouros"]
 NOMES_NAIPES_PRETOS = ["Espadas", "Paus"]
 
-# Estado global compartilhado com a thread de comandos IPC
-estado = {"quer_camera": False, "rodando": True}
+MAPA_VALORES = {"10": "T", "A": "A", "J": "J", "Q": "Q", "K": "K"}
+MAPA_NAIPES = {"Copas": "h", "Ouros": "d", "Espadas": "s", "Paus": "c"}
+
+lock_estado = threading.Lock()
+estado = {
+    "quer_camera": False,
+    "rodando": True,
+    "cartas_usadas": set(),
+    "resetar_leitura": False,
+}
+
+
+def traduzir_codigo(valor: str, naipe: str) -> str:
+    v = MAPA_VALORES.get(valor, valor)
+    n = MAPA_NAIPES.get(naipe, "")
+    return f"{v}{n}"
 
 
 def log(msg: str) -> None:
-    # Logs de debug vão para STDERR para não interferir no IPC do STDOUT
     print(msg, file=sys.stderr, flush=True)
 
 
 def evento(msg: str) -> None:
-    # Eventos lidos pelo servidor_mesa.py vão para STDOUT
     print(msg, flush=True)
 
 
@@ -68,7 +77,7 @@ class HardwareScanner:
         if self.ativo:
             self.led.on()
             self.vcc_ir.on()
-            time.sleep(0.05)  # Pequena pausa para estabilizar o módulo IR
+            time.sleep(0.05)
 
     def desligar(self) -> None:
         if self.ativo:
@@ -158,15 +167,27 @@ def prever(modelo, nomes, img) -> str:
 def ler_comandos() -> None:
     for linha in sys.stdin:
         cmd = linha.strip()
-        if cmd == "LIGAR":
-            estado["quer_camera"] = True
-        elif cmd == "DESLIGAR":
-            estado["quer_camera"] = False
-        elif cmd == "SAIR":
-            break
-        elif cmd:
-            log(f"Comando desconhecido: {cmd}")
-    estado["rodando"] = False
+        if not cmd:
+            continue
+        with lock_estado:
+            if cmd == "LIGAR":
+                estado["quer_camera"] = True
+            elif cmd == "DESLIGAR":
+                estado["quer_camera"] = False
+            elif cmd == "RESET_LEITURA":
+                estado["resetar_leitura"] = True
+            elif cmd.startswith("USADAS;"):
+                corpo = cmd.split(";", 1)[1].strip()
+                estado["cartas_usadas"] = {
+                    c.strip() for c in corpo.split(",") if c.strip()
+                }
+            elif cmd == "SAIR":
+                estado["rodando"] = False
+                break
+            else:
+                log(f"Comando desconhecido: {cmd}")
+    with lock_estado:
+        estado["rodando"] = False
 
 
 def main():
@@ -193,34 +214,63 @@ def main():
     momento_deteccao_ir = 0.0
     candidata_atual = None
     votos = 0
+    votos_duplicada = 0
     carta_confirmada = False
+    duplicada_notificada = None
 
     rx, ry, rw, rh = ROI_NUMERO
     nx, ny, nw, nh = ROI_NAIPE
 
     try:
-        while estado["rodando"]:
-            # 1. Gerenciamento de estado da câmera CSI e alimentação do LED/IR
-            if estado["quer_camera"] and cap is None:
-                from picamera2 import Picamera2
+        while True:
+            with lock_estado:
+                rodando = estado["rodando"]
+                quer_camera = estado["quer_camera"]
+                cartas_usadas = set(estado["cartas_usadas"])
+                resetar = estado["resetar_leitura"]
+                if resetar:
+                    estado["resetar_leitura"] = False
 
-                cap = Picamera2()
-                cap.configure(
-                    cap.create_video_configuration(
-                        main={"size": (640, 480), "format": "RGB888"}
-                    )
-                )
-                cap.start()
-                time.sleep(1.0)
-                hw.ligar()
+            if not rodando:
+                break
 
-                estado_ir_anterior = None
+            if resetar:
                 candidata_atual = None
                 votos = 0
+                votos_duplicada = 0
                 carta_confirmada = False
-                evento("CAMERA_LIGADA")
+                duplicada_notificada = None
 
-            elif not estado["quer_camera"] and cap is not None:
+            if quer_camera and cap is None:
+                try:
+                    from picamera2 import Picamera2
+
+                    cap = Picamera2()
+                    cap.configure(
+                        cap.create_video_configuration(
+                            main={"size": (640, 480), "format": "RGB888"}
+                        )
+                    )
+                    cap.start()
+                    time.sleep(1.0)
+                    hw.ligar()
+
+                    estado_ir_anterior = None
+                    candidata_atual = None
+                    votos = 0
+                    votos_duplicada = 0
+                    carta_confirmada = False
+                    duplicada_notificada = None
+                    evento("CAMERA_LIGADA")
+                except Exception as e:
+                    log(f"Falha ao ligar câmera: {e}")
+                    evento(f"ERRO;Falha ao ligar câmera: {e}")
+                    with lock_estado:
+                        estado["quer_camera"] = False
+                    time.sleep(0.5)
+                    continue
+
+            elif not quer_camera and cap is not None:
                 cap.stop()
                 cap.close()
                 cap = None
@@ -231,7 +281,6 @@ def main():
                 time.sleep(0.1)
                 continue
 
-            # 2. Monitora bordas de subida/descida do sensor infravermelho
             carta_presente = hw.carta_no_sensor
 
             if carta_presente != estado_ir_anterior:
@@ -244,20 +293,19 @@ def main():
                         evento("CARTA_REMOVIDA")
                 candidata_atual = None
                 votos = 0
+                votos_duplicada = 0
                 carta_confirmada = False
+                duplicada_notificada = None
                 estado_ir_anterior = carta_presente
 
-            # 3. Se não há carta no IR ou ela já foi confirmada, aguarda sem processar SVM
             if not carta_presente or carta_confirmada:
                 time.sleep(0.03)
                 continue
 
-            # 4. Aguarda o tempo de assentamento antes de iniciar a captura
             if (time.monotonic() - momento_deteccao_ir) < TEMPO_ESTABILIZACAO:
                 time.sleep(0.02)
                 continue
 
-            # 5. Captura frame e executa classificação com votação
             try:
                 bruto = cap.capture_array("main")
             except Exception as e:
@@ -287,20 +335,43 @@ def main():
                 )
 
             if valor != "?" and naipe != "?":
+                codigo = traduzir_codigo(valor, naipe)
                 leitura = (valor, naipe)
-                if leitura == candidata_atual:
-                    votos += 1
-                else:
-                    candidata_atual = leitura
-                    votos = 1
 
-                if votos >= VOTOS_NECESSARIOS:
-                    carta_confirmada = True
-                    log(f"[SCANNER] Carta confirmada: {valor} de {naipe}")
-                    evento(f"CARTA;{valor};{naipe}")
+                # Bloqueio inteligente de carta já usada na rodada:
+                # descarta falso positivo momentâneo; só avisa duplicata se persistir
+                if codigo in cartas_usadas:
+                    votos = 0
+                    if leitura == candidata_atual:
+                        votos_duplicada += 1
+                    else:
+                        candidata_atual = leitura
+                        votos_duplicada = 1
+
+                    if (
+                        votos_duplicada >= VOTOS_NECESSARIOS
+                        and duplicada_notificada != codigo
+                    ):
+                        duplicada_notificada = codigo
+                        log(f"[SCANNER] Carta duplicada bloqueada: {valor} de {naipe}")
+                        evento(f"DUPLICADA;{valor};{naipe}")
+                else:
+                    votos_duplicada = 0
+                    duplicada_notificada = None
+                    if leitura == candidata_atual:
+                        votos += 1
+                    else:
+                        candidata_atual = leitura
+                        votos = 1
+
+                    if votos >= VOTOS_NECESSARIOS:
+                        carta_confirmada = True
+                        log(f"[SCANNER] Carta confirmada: {valor} de {naipe}")
+                        evento(f"CARTA;{valor};{naipe}")
             else:
                 candidata_atual = None
                 votos = 0
+                votos_duplicada = 0
 
             time.sleep(0.03)
     finally:
