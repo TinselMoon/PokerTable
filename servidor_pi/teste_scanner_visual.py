@@ -29,6 +29,11 @@ NOMES_VALORES = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K
 NOMES_NAIPES_VERMELHOS = ["Copas", "Ouros"]
 NOMES_NAIPES_PRETOS = ["Espadas", "Paus"]
 
+TEMPO_ESTABILIZACAO = (
+    0.40  # Segundos de espera após o IR detectar (para você encostar a carta)
+)
+VOTOS_NECESSARIOS = 7  # Quantos frames idênticos seguidos para confirmar a carta
+
 
 def orientar(bruto):
     girado = cv2.rotate(bruto, cv2.ROTATE_90_COUNTERCLOCKWISE)
@@ -139,30 +144,35 @@ def main():
     print("  [I] -> Inverter lógica do sensor IR em tempo real\n")
 
     estado_ir_anterior = None
-    ultima_carta_logada = None
+    momento_deteccao_ir = 0.0
+    candidata_atual = None
+    votos = 0
+    carta_confirmada = False
+
     rx, ry, rw, rh = ROI_NUMERO
     nx, ny, nw, nh = ROI_NAIPE
 
     try:
         while True:
-            # Leitura do sensor infravermelho
             carta_presente = sensor_ir.is_active
 
-            # Loga somente quando o estado do sensor muda (para não poluir o terminal)
+            # 1. Detectou mudança no sensor IR
             if carta_presente != estado_ir_anterior:
                 if carta_presente:
-                    print(">>> [IR] CARTA DETECTADA NO SCANNER! Lendo imagem...")
+                    momento_deteccao_ir = time.monotonic()
+                    print(">>> [IR] Carta entrou! Aguardando estabilizar no canto...")
                 else:
-                    print("--- [IR] Scanner vazio (carta removida).")
-                    ultima_carta_logada = None
+                    print("--- [IR] Scanner vazio (carta removida).\n")
+                # Reseta os contadores sempre que entra ou sai carta
+                candidata_atual = None
+                votos = 0
+                carta_confirmada = False
                 estado_ir_anterior = carta_presente
 
-            # Captura e orienta o frame da câmera
             bruto = cap.capture_array("main")
             frame = orientar(bruto)
             frame_debug = frame.copy()
 
-            # Desenha os retângulos de ROI (Azul = Número, Vermelho = Naipe)
             cv2.rectangle(frame_debug, (rx, ry), (rx + rw, ry + rh), (255, 0, 0), 2)
             cv2.rectangle(frame_debug, (nx, ny), (nx + nw, ny + nh), (0, 0, 255), 2)
 
@@ -170,38 +180,63 @@ def main():
             cor_status = (0, 165, 255)  # Laranja
 
             if carta_presente:
-                rec_num = frame[ry : ry + rh, rx : rx + rw]
-                rec_nai = frame[ny : ny + nh, nx : nx + nw]
+                tempo_decorrido = time.monotonic() - momento_deteccao_ir
 
-                res_v = extrair_simbolo(rec_num)
-                res_n = extrair_simbolo(rec_nai)
+                # 2. Aguarda você terminar de deslizar a carta até o canto
+                if tempo_decorrido < TEMPO_ESTABILIZACAO:
+                    texto_carta = "Estabilizando carta..."
+                    cor_status = (0, 255, 255)  # Amarelo
 
-                valor = (
-                    prever(svm_valores, NOMES_VALORES, res_v[0])
-                    if res_v is not None
-                    else "?"
-                )
-                naipe = "?"
-                if res_n is not None:
-                    img_n, is_red = res_n
-                    naipe = (
-                        prever(svm_vermelhos, NOMES_NAIPES_VERMELHOS, img_n)
-                        if is_red
-                        else prever(svm_pretos, NOMES_NAIPES_PRETOS, img_n)
+                # 3. Se já confirmou esta carta, não lê de novo até você tirar ela
+                elif carta_confirmada:
+                    texto_carta = (
+                        f"CONFIRMADA: {candidata_atual[0]} de {candidata_atual[1]}"
                     )
+                    cor_status = (0, 255, 0)  # Verde
 
-                texto_carta = f"Leitura: {valor} de {naipe}"
-                cor_status = (
-                    (0, 255, 0) if (valor != "?" and naipe != "?") else (0, 255, 255)
-                )
+                # 4. Faz a leitura e acumula votos até confirmar
+                else:
+                    rec_num = frame[ry : ry + rh, rx : rx + rw]
+                    rec_nai = frame[ny : ny + nh, nx : nx + nw]
 
-                # Loga no terminal sempre que identificar uma carta válida (ou mudar de carta)
-                carta_atual = f"{valor} de {naipe}"
-                if valor != "?" and naipe != "?" and carta_atual != ultima_carta_logada:
-                    print(f"    [VISÃO] Carta identificada: {carta_atual}")
-                    ultima_carta_logada = carta_atual
+                    res_v = extrair_simbolo(rec_num)
+                    res_n = extrair_simbolo(rec_nai)
 
-            # Escreve o status do IR e da leitura diretamente na janela de vídeo
+                    valor = (
+                        prever(svm_valores, NOMES_VALORES, res_v[0])
+                        if res_v is not None
+                        else "?"
+                    )
+                    naipe = "?"
+                    if res_n is not None:
+                        img_n, is_red = res_n
+                        naipe = (
+                            prever(svm_vermelhos, NOMES_NAIPES_VERMELHOS, img_n)
+                            if is_red
+                            else prever(svm_pretos, NOMES_NAIPES_PRETOS, img_n)
+                        )
+
+                    if valor != "?" and naipe != "?":
+                        leitura = (valor, naipe)
+                        if leitura == candidata_atual:
+                            votos += 1
+                        else:
+                            candidata_atual = leitura
+                            votos = 1
+
+                        texto_carta = f"Validando: {valor} de {naipe} ({votos}/{VOTOS_NECESSARIOS})"
+                        cor_status = (0, 255, 255)
+
+                        if votos >= VOTOS_NECESSARIOS:
+                            carta_confirmada = True
+                            print(
+                                f"    [CONFIRMADA] Carta lida com segurança: {valor} de {naipe}"
+                            )
+                    else:
+                        candidata_atual = None
+                        votos = 0
+                        texto_carta = "Ajuste a carta no quadro..."
+
             status_ir_txt = "IR: CARTA DETECTADA" if carta_presente else "IR: VAZIO"
             cv2.putText(
                 frame_debug,
@@ -221,14 +256,12 @@ def main():
                 cor_status,
                 2,
             )
-
             cv2.imshow("Teste Scanner - Camera, IR e SVM", frame_debug)
 
             tecla = cv2.waitKey(30) & 0xFF
             if tecla == ord("q"):
                 break
             elif tecla == ord("i"):
-                # Permite inverter a lógica do IR sem precisar fechar o script
                 novo_estado = not sensor_ir.active_state
                 sensor_ir.close()
                 sensor_ir = DigitalInputDevice(
