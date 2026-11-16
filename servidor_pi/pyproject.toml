@@ -1,0 +1,12 @@
+[project]
+name = "servidor-poker-pi"
+version = "0.1.0"
+description = "Servidor de rede, regras de poker e scanner de cartas no Raspberry Pi"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "treys",
+]
+
+[tool.uv]
+system-site-packages = true

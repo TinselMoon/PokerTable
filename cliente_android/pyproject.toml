@@ -1,0 +1,11 @@
+[project]
+name = "pokertable"
+version = "0.1.0"
+dependencies = ["flet"]
+
+[tool.flet]
+org = "com.poker"
+product = "PokerTable"
+
+[tool.flet.app]
+path = "src"
