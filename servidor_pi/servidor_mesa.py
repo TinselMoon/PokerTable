@@ -185,6 +185,10 @@ class ServidorMesa:
 
     def _atender_cliente(self, conn: socket.socket, addr) -> None:
         print(f"[Rede] Celular conectado: {addr}")
+        try:
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except Exception:
+            pass
         buffer = ""
         try:
             while self._rodando:
@@ -229,9 +233,12 @@ class ServidorMesa:
             return
         with self.lock:
             sockets_humanos = [
-                jid for jid in self.jogo.jogadores.keys() if isinstance(jid, socket.socket)
+                jid
+                for jid in self.jogo.jogadores.keys()
+                if isinstance(jid, socket.socket)
             ]
 
+        lotes_por_conn: dict[socket.socket, list[bytes]] = {}
         for destino, tipo, dados in mensagens:
             payload = empacotar(tipo, **dados)
             if destino == "TODOS":
@@ -242,10 +249,13 @@ class ServidorMesa:
                 continue
 
             for conn in destinatarios:
-                try:
-                    conn.sendall(payload)
-                except Exception:
-                    pass
+                lotes_por_conn.setdefault(conn, []).append(payload)
+
+        for conn, pacotes in lotes_por_conn.items():
+            try:
+                conn.sendall(b"".join(pacotes))
+            except Exception:
+                pass
 
     # =========================================================================
     # BOT DE TESTES (AGENDAMENTO ASSÍNCRONO)

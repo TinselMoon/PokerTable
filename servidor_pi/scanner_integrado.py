@@ -42,6 +42,12 @@ estado = {
     "resetar_leitura": False,
 }
 
+HOG_DESCRIPTOR = cv2.HOGDescriptor((32, 32), (16, 16), (8, 8), (8, 8), 9)
+
+
+def calcular_hog(img):
+    return HOG_DESCRIPTOR.compute(img).reshape(1, -1)
+
 
 def traduzir_codigo(valor: str, naipe: str) -> str:
     v = MAPA_VALORES.get(valor, valor)
@@ -270,12 +276,18 @@ def main():
                     time.sleep(0.5)
                     continue
 
-            elif not quer_camera and cap is not None:
-                cap.stop()
-                cap.close()
-                cap = None
-                hw.desligar()
-                evento("CAMERA_DESLIGADA")
+            elif not quer_camera:
+                if estado_ir_anterior is not None:
+                    hw.desligar()
+                    estado_ir_anterior = None
+                    candidata_atual = None
+                    votos = 0
+                    votos_duplicada = 0
+                    carta_confirmada = False
+                    duplicada_notificada = None
+                    evento("CAMERA_DESLIGADA")
+                time.sleep(0.12)
+                continue
 
             if cap is None:
                 time.sleep(0.1)

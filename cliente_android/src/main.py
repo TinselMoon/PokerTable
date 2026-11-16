@@ -102,13 +102,14 @@ class AndroidTTS:
 
     def _garantir_idioma(self):
         if self._tts is not None and not self._idioma_configurado:
+            self._idioma_configurado = True
             try:
                 from jnius import autoclass
 
                 Locale = autoclass("java.util.Locale")
                 res = self._tts.setLanguage(Locale("pt", "BR"))
-                if res >= 0:
-                    self._idioma_configurado = True
+                if res < 0:
+                    self._tts.setLanguage(Locale.getDefault())
             except Exception:
                 pass
 
@@ -581,10 +582,11 @@ def main(page: ft.Page):
         buffer = ""
         try:
             while conectado and sock_cliente:
-                dados_brutos = sock_cliente.recv(1024).decode("utf-8")
+                dados_brutos = sock_cliente.recv(4096).decode("utf-8")
                 if not dados_brutos:
                     break
                 buffer += dados_brutos
+                atualizou = False
                 while "\n" in buffer:
                     linha, buffer = buffer.split("\n", 1)
                     if not linha.strip():
@@ -594,10 +596,12 @@ def main(page: ft.Page):
                         handler = handlers_eventos.get(tipo)
                         if handler:
                             handler(dados)
-                            page.update()
+                            atualizou = True
                     except Exception as ui_err:
                         txt_info.value = f"Erro de interface: {ui_err}"
-                        page.update()
+                        atualizou = True
+                if atualizou:
+                    page.update()
         except Exception as net_err:
             if conectado:
                 voltar_para_conexao(f"Desconectado: {net_err}")
