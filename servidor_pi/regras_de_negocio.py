@@ -38,7 +38,7 @@ class JogoPoker:
         return self._gerar_estado_individualizado(f"{jogador['nome']} saiu da mesa.")
 
     def iniciar_nova_rodada(self) -> list[tuple]:
-        if len(self.jogadores) < 2:
+        if len(self.jogadores) < 1:
             return self._gerar_estado_individualizado(
                 "Aguardando pelo menos 2 jogadores conectarem..."
             )
