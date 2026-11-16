@@ -6,6 +6,13 @@ from protocolo import empacotar, desempacotar
 SALDO_MIN = 200.0
 SALDO_MAX = 10000.0
 
+ICONES_NAIPE = {
+    "s": "♠",
+    "h": "♥",
+    "d": "♦",
+    "c": "♣",
+}
+
 
 def main(page: ft.Page):
     page.title = "PokerTable"
@@ -15,6 +22,7 @@ def main(page: ft.Page):
 
     sock_cliente = None
     conectado = False
+    partida_iniciada = False
 
     # =========================================================================
     # TELA 1: CONEXÃO E CADASTRO DO JOGADOR
@@ -30,6 +38,10 @@ def main(page: ft.Page):
         label="Saldo Inicial (R$ 200 a R$ 10.000)",
         value="1000",
         keyboard_type=ft.KeyboardType.NUMBER,
+    )
+    switch_testes = ft.Switch(
+        label="Modo Testes (Jogar contra Robô)",
+        value=False,
     )
 
     txt_notificacao = ft.Text("", color=ft.Colors.WHITE, weight=ft.FontWeight.BOLD)
@@ -59,7 +71,7 @@ def main(page: ft.Page):
         "Pote: R$ 0", size=16, weight=ft.FontWeight.BOLD, color=ft.Colors.GREEN_300
     )
     txt_turno = ft.Text("Vez de: -", size=15, weight=ft.FontWeight.BOLD)
-    txt_info = ft.Text("Aguardando início da rodada...", size=14)
+    txt_info = ft.Text("Clique em 'Iniciar Partida' para começar.", size=14)
 
     row_mao = ft.Row(spacing=10)
     row_mesa = ft.Row(spacing=8, wrap=True)
@@ -71,16 +83,21 @@ def main(page: ft.Page):
     )
 
     def ir_para_tela_mesa(nome: str, saldo: float, ip: str, porta: int):
+        nonlocal partida_iniciada
+        partida_iniciada = False
         box_notificacao.visible = False
-        txt_jogador_header.value = f"{nome} • Conectado em {ip}:{porta}"
+        tag_teste = " [VS ROBÔ]" if switch_testes.value else ""
+        txt_jogador_header.value = f"{nome}{tag_teste} • {ip}:{porta}"
         txt_saldo.value = f"Saldo: R$ {saldo:.0f}"
+        atualizar_botao_partida()
         tela_conexao.visible = False
         tela_mesa.visible = True
         page.update()
 
     def voltar_para_conexao(motivo: str = ""):
-        nonlocal conectado, sock_cliente
+        nonlocal conectado, sock_cliente, partida_iniciada
         conectado = False
+        partida_iniciada = False
         if sock_cliente:
             try:
                 sock_cliente.close()
@@ -106,16 +123,56 @@ def main(page: ft.Page):
             except Exception as ex:
                 voltar_para_conexao(f"Conexão perdida com o servidor: {ex}")
 
-    def criar_carta_ui(codigo: str, cor: str):
+    def criar_carta_ui(codigo: str):
+        """Converte '8c' -> '8 ♣' e 'Th' -> '10 ♥'."""
+        if len(codigo) >= 2:
+            valor_bruto = codigo[:-1]
+            letra_naipe = codigo[-1].lower()
+            valor_exibido = "10" if valor_bruto == "T" else valor_bruto
+            icone = ICONES_NAIPE.get(letra_naipe, letra_naipe)
+            texto_carta = f"{valor_exibido} {icone}"
+            cor_texto = (
+                ft.Colors.RED_700 if letra_naipe in ("h", "d") else ft.Colors.BLACK
+            )
+        else:
+            texto_carta = codigo
+            cor_texto = ft.Colors.BLACK
+
         return ft.Container(
-            content=ft.Text(codigo, size=22, weight=ft.FontWeight.BOLD),
-            padding=ft.Padding.symmetric(horizontal=14, vertical=10),
-            bgcolor=cor,
+            content=ft.Text(
+                texto_carta,
+                size=22,
+                weight=ft.FontWeight.BOLD,
+                color=cor_texto,
+            ),
+            padding=12,
+            bgcolor=ft.Colors.WHITE,
             border_radius=8,
         )
 
+    def atualizar_botao_partida():
+        if partida_iniciada:
+            btn_controle_partida.content = "Reiniciar Mesa"
+            btn_controle_partida.bgcolor = ft.Colors.ORANGE_800
+        else:
+            btn_controle_partida.content = "Iniciar Partida"
+            btn_controle_partida.bgcolor = ft.Colors.GREEN_700
+
+    def on_clique_controle_partida(e):
+        if partida_iniciada:
+            enviar_comando("reiniciar_mesa")
+        else:
+            enviar_comando("iniciar_partida", modo_testes=switch_testes.value)
+
     def on_estado_mesa(dados: dict):
-        txt_fase.value = f"Fase: {dados.get('fase', '-')}"
+        nonlocal partida_iniciada
+        partida_iniciada = dados.get("partida_iniciada", False)
+        fase = dados.get("fase", "-")
+        atualizar_botao_partida()
+
+        btn_proxima_mao.visible = fase == "SHOWDOWN"
+
+        txt_fase.value = f"Fase: {fase}"
         txt_pote.value = f"Pote: R$ {dados.get('pote', 0):.0f}"
         txt_saldo.value = f"Saldo: R$ {dados.get('seu_saldo', 0):.0f}"
         txt_info.value = dados.get("msg", "")
@@ -136,19 +193,19 @@ def main(page: ft.Page):
             f"Pagar R${a_pagar:.0f}" if a_pagar > 0 else "Passar (Check)"
         )
 
-    def on_nova_rodada(dados: dict):
+    def on_limpar_mesa(dados: dict):
         row_mao.controls.clear()
         row_mesa.controls.clear()
 
     handlers_eventos = {
         "estado_mesa": on_estado_mesa,
         "carta_mao": lambda d: row_mao.controls.append(
-            criar_carta_ui(d.get("carta", "?"), ft.Colors.BLUE_900)
+            criar_carta_ui(d.get("carta", "?"))
         ),
         "carta_mesa": lambda d: row_mesa.controls.append(
-            criar_carta_ui(d.get("carta", "?"), ft.Colors.GREEN_900)
+            criar_carta_ui(d.get("carta", "?"))
         ),
-        "nova_rodada": on_nova_rodada,
+        "limpar_mesa": on_limpar_mesa,
         "erro": lambda d: setattr(txt_info, "value", f"Aviso: {d.get('msg', '')}"),
     }
 
@@ -163,17 +220,24 @@ def main(page: ft.Page):
                 buffer += dados_brutos
                 while "\n" in buffer:
                     linha, buffer = buffer.split("\n", 1)
-                    if linha.strip():
+                    if not linha.strip():
+                        continue
+                    try:
                         tipo, dados = desempacotar(linha)
                         handler = handlers_eventos.get(tipo)
                         if handler:
                             handler(dados)
                             page.update()
-        except Exception:
-            pass
+                    except Exception as ui_err:
+                        txt_info.value = f"Erro de interface: {ui_err}"
+                        page.update()
+        except Exception as net_err:
+            if conectado:
+                voltar_para_conexao(f"Desconectado: {net_err}")
+                return
 
         if conectado:
-            voltar_para_conexao("Desconectado do servidor.")
+            voltar_para_conexao("Servidor encerrou a conexão.")
 
     def conectar(e):
         nonlocal sock_cliente, conectado
@@ -221,7 +285,12 @@ def main(page: ft.Page):
             sock_cliente = sock
             conectado = True
 
-            enviar_comando("registro", nome=nome, saldo=saldo_inicial)
+            enviar_comando(
+                "registro",
+                nome=nome,
+                saldo=saldo_inicial,
+                modo_testes=switch_testes.value,
+            )
             ir_para_tela_mesa(nome, saldo_inicial, ip, porta)
 
             threading.Thread(target=escutar_servidor, daemon=True).start()
@@ -238,7 +307,6 @@ def main(page: ft.Page):
             txt_info.value = "Digite um número válido para o Raise."
             page.update()
 
-    # Botões Tela 1
     btn_conectar = ft.Button(
         "Entrar na Mesa",
         bgcolor=ft.Colors.GREEN_700,
@@ -247,11 +315,18 @@ def main(page: ft.Page):
         expand=True,
         on_click=conectar,
     )
-
-    # Botões Tela 2
-    btn_nova_rodada = ft.OutlinedButton(
-        "Nova Rodada",
-        on_click=lambda e: enviar_comando("iniciar_rodada"),
+    btn_controle_partida = ft.Button(
+        "Iniciar Partida",
+        bgcolor=ft.Colors.GREEN_700,
+        color=ft.Colors.WHITE,
+        on_click=on_clique_controle_partida,
+    )
+    btn_proxima_mao = ft.OutlinedButton(
+        "Próxima Mão",
+        visible=False,
+        on_click=lambda e: enviar_comando(
+            "iniciar_partida", modo_testes=switch_testes.value
+        ),
     )
     btn_sair = ft.OutlinedButton(
         "Sair",
@@ -281,7 +356,6 @@ def main(page: ft.Page):
         on_click=on_raise,
     )
 
-    # Montagem das duas telas
     tela_conexao = ft.Column(
         visible=True,
         spacing=14,
@@ -291,6 +365,7 @@ def main(page: ft.Page):
             input_porta,
             input_nome,
             input_saldo,
+            switch_testes,
             box_notificacao,
             ft.Row([btn_conectar]),
         ],
@@ -305,7 +380,7 @@ def main(page: ft.Page):
                 alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
             ),
             ft.Row(
-                [txt_fase, btn_nova_rodada],
+                [txt_fase, ft.Row([btn_proxima_mao, btn_controle_partida], spacing=8)],
                 alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
             ),
             ft.Row(

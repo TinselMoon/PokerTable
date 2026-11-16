@@ -10,7 +10,11 @@ from gpiozero import DigitalInputDevice, DigitalOutputDevice
 # CONFIGURAÇÕES DE HARDWARE E CALIBRAÇÃO
 # ==============================================================================
 # Ajuste para False se o seu sensor IR operar em lógica invertida
+<<<<<<< HEAD
 IR_ATIVO_EM_HIGH = True
+=======
+IR_ATIVO_EM_HIGH = False
+>>>>>>> Pokerbeta
 
 # Pinos BCM (físicos: 11 -> GPIO 17, 13 -> GPIO 27, 15 -> GPIO 22)
 PINO_LED = 17
