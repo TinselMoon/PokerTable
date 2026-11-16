@@ -29,6 +29,11 @@ NOMES_VALORES = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K
 NOMES_NAIPES_VERMELHOS = ["Copas", "Ouros"]
 NOMES_NAIPES_PRETOS = ["Espadas", "Paus"]
 
+TEMPO_ESTABILIZACAO = (
+    0.40  # Segundos de espera após o IR detectar (para você encostar a carta)
+)
+VOTOS_NECESSARIOS = 7  # Quantos frames idênticos seguidos para confirmar a carta
+
 
 def orientar(bruto):
     girado = cv2.rotate(bruto, cv2.ROTATE_90_COUNTERCLOCKWISE)
