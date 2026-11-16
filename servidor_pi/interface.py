@@ -36,9 +36,7 @@ class ScrollableTouchFrame(tk.Frame):
 
     def __init__(self, master, bg=COR_BG, **kwargs):
         super().__init__(master, bg=bg, **kwargs)
-        self.canvas = tk.Canvas(
-            self, bg=bg, bd=0, highlightthickness=0
-        )
+        self.canvas = tk.Canvas(self, bg=bg, bd=0, highlightthickness=0)
         self.scrollbar = tk.Scrollbar(
             self, orient="vertical", command=self.canvas.yview, width=10
         )
@@ -92,6 +90,17 @@ class ScrollableTouchFrame(tk.Frame):
 class InterfacePokerLCD:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
+        self.root.title("PokerTable Central")
+
+        # Detecta a resolução real do display (evita cortar o rodapé em telas 320x240)
+        global LARGURA, ALTURA, ALTURA_CORPO
+        larg_tela = self.root.winfo_screenwidth()
+        alt_tela = self.root.winfo_screenheight()
+        if larg_tela > 0 and alt_tela > 0:
+            LARGURA = min(480, larg_tela)
+            ALTURA = min(320, alt_tela)
+            ALTURA_CORPO = ALTURA - ALTURA_HEADER
+
         self.root.title("PokerTable Central")
         self.root.geometry(f"{LARGURA}x{ALTURA}+0+0")
         self.root.configure(bg=COR_BG, cursor="none")
@@ -166,8 +175,13 @@ class InterfacePokerLCD:
         f = tk.Frame(self.root, bg=COR_BG)
         self.frame_lobby = f
 
-        topo = tk.Frame(f, bg="#181818", height=36)
-        topo.pack(fill="x", padx=6, pady=(4, 4))
+        f.grid_columnconfigure(0, weight=1)
+        f.grid_rowconfigure(0, weight=0)  # Topo (Total e Blinds)
+        f.grid_rowconfigure(1, weight=1)  # Lista de jogadores (expande/encolhe)
+        f.grid_rowconfigure(2, weight=0)  # Rodapé (Bot e Iniciar Partida - fixo)
+
+        topo = tk.Frame(f, bg="#181818", height=34)
+        topo.grid(row=0, column=0, sticky="ew", padx=6, pady=(4, 2))
         topo.pack_propagate(False)
 
         self.lbl_lobby_total = tk.Label(
@@ -193,7 +207,7 @@ class InterfacePokerLCD:
             width=2,
             bd=0,
             highlightthickness=0,
-        ).pack(side="left", padx=2, pady=3)
+        ).pack(side="left", padx=2, pady=2)
 
         self.lbl_blinds = tk.Label(
             ctrl_blinds,
@@ -216,13 +230,13 @@ class InterfacePokerLCD:
             width=2,
             bd=0,
             highlightthickness=0,
-        ).pack(side="left", padx=2, pady=3)
+        ).pack(side="left", padx=2, pady=2)
 
         self.scroll_lobby = ScrollableTouchFrame(f, bg=COR_BG)
-        self.scroll_lobby.pack(fill="both", expand=True, padx=6, pady=2)
+        self.scroll_lobby.grid(row=1, column=0, sticky="nsew", padx=6, pady=2)
 
-        rodape = tk.Frame(f, bg=COR_BG, height=48)
-        rodape.pack(fill="x", padx=6, pady=(4, 6))
+        rodape = tk.Frame(f, bg=COR_BG, height=44)
+        rodape.grid(row=2, column=0, sticky="ew", padx=6, pady=(2, 4))
         rodape.pack_propagate(False)
 
         self.btn_bot = tk.Button(
@@ -422,7 +436,9 @@ class InterfacePokerLCD:
             bd=0,
             highlightthickness=0,
         )
-        self.btn_confirmar_mesa.pack(side="right", fill="both", expand=True, padx=(6, 0))
+        self.btn_confirmar_mesa.pack(
+            side="right", fill="both", expand=True, padx=(6, 0)
+        )
 
     # =========================================================================
     # TELA 4: APOSTAS EM ANDAMENTO (PRÉ-FLOP, FLOP, TURN, RIVER)
@@ -439,7 +455,11 @@ class InterfacePokerLCD:
         esq.pack(side="left", fill="both", expand=True, padx=8, pady=4)
 
         tk.Label(
-            esq, text="VEZ DE:", fg=COR_SUB, bg=COR_CARD, font=("DejaVu Sans", 8, "bold")
+            esq,
+            text="VEZ DE:",
+            fg=COR_SUB,
+            bg=COR_CARD,
+            font=("DejaVu Sans", 8, "bold"),
         ).pack(anchor="w")
         self.lbl_jogo_vez = tk.Label(
             esq, text="-", fg="#69F0AE", bg=COR_CARD, font=("DejaVu Sans", 15, "bold")
@@ -719,9 +739,7 @@ class InterfacePokerLCD:
         fase = s["fase"]
 
         if fase == "AGUARDANDO":
-            self.lbl_header_titulo.config(
-                text=f"LOBBY • {self.ip_local}:5000"
-            )
+            self.lbl_header_titulo.config(text=f"LOBBY • {self.ip_local}:5000")
             self._mostrar_tela("LOBBY", self.frame_lobby)
             self._atualizar_lobby(s)
 
@@ -900,12 +918,8 @@ class InterfacePokerLCD:
 
     def _atualizar_jogo(self, s: dict):
         self.lbl_jogo_vez.config(text=s["jogador_vez_nome"])
-        extra_side = (
-            f" (+{s['qtd_side_pots']} Side)" if s["qtd_side_pots"] > 0 else ""
-        )
-        self.lbl_jogo_pote.config(
-            text=f"POTE: R$ {fmt_valor(s['pote'])}{extra_side}"
-        )
+        extra_side = f" (+{s['qtd_side_pots']} Side)" if s["qtd_side_pots"] > 0 else ""
+        self.lbl_jogo_pote.config(text=f"POTE: R$ {fmt_valor(s['pote'])}{extra_side}")
         self.lbl_jogo_aposta.config(
             text=f"Aposta atual: R$ {fmt_valor(s['aposta_atual'])}"
         )
@@ -921,7 +935,11 @@ class InterfacePokerLCD:
 
         self.scroll_jogo.limpar()
         for idx, j in enumerate(s["jogadores"]):
-            cor = "#1B3B2B" if j["eh_vez"] else (COR_CARD if idx % 2 == 0 else COR_CARD_ALT)
+            cor = (
+                "#1B3B2B"
+                if j["eh_vez"]
+                else (COR_CARD if idx % 2 == 0 else COR_CARD_ALT)
+            )
             linha = tk.Frame(self.scroll_jogo.inner, bg=cor, height=32)
             linha.pack(fill="x", pady=1, padx=2)
             linha.pack_propagate(False)
