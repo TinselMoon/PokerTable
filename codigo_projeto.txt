@@ -1,0 +1,5343 @@
+=== ./servidor_pi/regras_de_negocio.py ===
+import random
+from treys import Card, Evaluator
+
+BOT_ID = "BOT_TESTE"
+SALDO_MIN_REBUY = 200.0
+SALDO_MAX_REBUY = 10000.0
+
+TRADUCAO_MAOS = {
+    "Royal Flush": "Royal Flush",
+    "Straight Flush": "Straight Flush",
+    "Four of a Kind": "Quadra",
+    "Full House": "Full House",
+    "Flush": "Flush",
+    "Straight": "Sequência",
+    "Three of a Kind": "Trinca",
+    "Two Pair": "Dois Pares",
+    "Pair": "Um Par",
+    "High Card": "Carta Alta",
+}
+
+PASSOS_SMALL_BLIND = [5.0, 10.0, 20.0, 25.0, 50.0, 100.0, 200.0, 500.0]
+
+
+def fmt_valor(v: float) -> str:
+    v = round(v, 2)
+    return f"{v:.0f}" if v == int(v) else f"{v:.2f}"
+
+
+class JogoPoker:
+    def __init__(self):
+        self.evaluator = Evaluator()
+
+        # Jogadores atualmente conectados (+ Bot se ativo)
+        self.jogadores: dict = {}
+        self.ordem_jogadores: list = []
+
+        # Histórico financeiro de jogadores que saíram após jogar (para o placar final)
+        self.historico_desconectados: list[dict] = []
+
+        # Configurações da mesa
+        self.indice_sb_cfg = 1  # Padrão: SB=10 / BB=20
+        self.small_blind = PASSOS_SMALL_BLIND[self.indice_sb_cfg]
+        self.big_blind = self.small_blind * 2.0
+        self.bot_ativo = False
+
+        # Estado da sessão / rodada
+        self.fase = "AGUARDANDO"
+        self.numero_rodada = 0
+        self.indice_dealer_ordem = -1
+        self.participantes_mao: list = []
+        self.dealer_id = None
+        self.sb_id = None
+        self.bb_id = None
+
+        # Controle de scanner e cartas
+        self.cartas_usadas_rodada: set[str] = set()
+        self.buffer_cartas: list[str] = []
+        self.indice_distribuicao = 0
+        self.cartas_mesa_ocultas: list[str] = []
+        self.cartas_mesa_reveladas: list[str] = []
+        self.aviso_scanner = ""
+
+        # Controle de apostas e turnos
+        self.pote = 0.0
+        self.aposta_atual = 0.0
+        self.indice_turno_mao = 0
+        self.agiram_na_street: set = set()
+        self.ultima_acao_msg = "Aguardando jogadores conectarem..."
+        self.resultado_rodada: list[dict] = []
+        self.placar_final: list[dict] = []
+
+    # =========================================================================
+    # CONFIGURAÇÃO NO LOBBY (BLINDS, REORDENAÇÃO, BOT DE TESTES)
+    # =========================================================================
+    def ajustar_blinds(self, delta: int) -> None:
+        if self.fase != "AGUARDANDO":
+            return
+        novo = max(0, min(len(PASSOS_SMALL_BLIND) - 1, self.indice_sb_cfg + delta))
+        self.indice_sb_cfg = novo
+        self.small_blind = PASSOS_SMALL_BLIND[novo]
+        self.big_blind = self.small_blind * 2.0
+
+    def alternar_bot_testes(self) -> list[tuple]:
+        if self.fase != "AGUARDANDO":
+            return []
+        if self.bot_ativo:
+            self.bot_ativo = False
+            self.jogadores.pop(BOT_ID, None)
+            if BOT_ID in self.ordem_jogadores:
+                self.ordem_jogadores.remove(BOT_ID)
+            self.ultima_acao_msg = "Modo Testes (Bot) desativado."
+        else:
+            self.bot_ativo = True
+            self.jogadores[BOT_ID] = {
+                "id": BOT_ID,
+                "nome": "Robô (Bot)",
+                "is_bot": True,
+                "saldo": 1000.0,
+                "saldo_inicial": 1000.0,
+                "total_investido": 1000.0,
+                "mao": [],
+                "aposta_rodada": 0.0,
+                "contribuicao_mao": 0.0,
+                "ativo": False,
+                "all_in": False,
+                "na_mao": False,
+                "em_espera": False,
+                "jogou_sessao": False,
+            }
+            if BOT_ID not in self.ordem_jogadores:
+                self.ordem_jogadores.append(BOT_ID)
+            self.ultima_acao_msg = "Modo Testes ativado: Robô (Bot) entrou na mesa."
+        return self._gerar_estado_individualizado(self.ultima_acao_msg)
+
+    def mover_jogador(self, jid, direcao: int) -> list[tuple]:
+        """direcao = -1 (subir) ou +1 (descer) na ordem física da mesa."""
+        if self.fase != "AGUARDANDO" or jid not in self.ordem_jogadores:
+            return []
+        idx = self.ordem_jogadores.index(jid)
+        novo_idx = idx + direcao
+        if 0 <= novo_idx < len(self.ordem_jogadores):
+            self.ordem_jogadores[idx], self.ordem_jogadores[novo_idx] = (
+                self.ordem_jogadores[novo_idx],
+                self.ordem_jogadores[idx],
+            )
+        return self._gerar_estado_individualizado("Ordem da mesa atualizada.")
+
+    # =========================================================================
+    # CONEXÃO, DESCONEXÃO E REBUY
+    # =========================================================================
+    def registrar_jogador(self, conn, nome: str, saldo: float) -> list[tuple]:
+        saldo_f = round(float(saldo), 2)
+        em_espera = self.fase != "AGUARDANDO"
+
+        self.jogadores[conn] = {
+            "id": conn,
+            "nome": nome,
+            "is_bot": False,
+            "saldo": saldo_f,
+            "saldo_inicial": saldo_f,
+            "total_investido": saldo_f,
+            "mao": [],
+            "aposta_rodada": 0.0,
+            "contribuicao_mao": 0.0,
+            "ativo": False,
+            "all_in": False,
+            "na_mao": False,
+            "em_espera": em_espera,
+            "jogou_sessao": False,
+        }
+        if conn not in self.ordem_jogadores:
+            self.ordem_jogadores.append(conn)
+
+        mensagens = []
+        if em_espera:
+            for c in self.cartas_mesa_reveladas:
+                mensagens.append((conn, "carta_mesa", {"carta": c}))
+            if self.fase == "PLACAR_FINAL":
+                mensagens.append((conn, "placar_final", {"ranking": self.placar_final}))
+            aviso = f"{nome} entrou em modo de espera (jogará na próxima rodada)."
+        else:
+            aviso = f"{nome} conectou com R$ {fmt_valor(saldo_f)}."
+
+        self.ultima_acao_msg = aviso
+        mensagens.extend(self._gerar_estado_individualizado(aviso))
+        return mensagens
+
+    def remover_jogador(self, conn) -> list[tuple]:
+        jogador = self.jogadores.pop(conn, None)
+        if not jogador:
+            return []
+
+        if conn in self.ordem_jogadores:
+            self.ordem_jogadores.remove(conn)
+
+        if jogador["jogou_sessao"]:
+            self.historico_desconectados.append(
+                {
+                    "nome": f"{jogador['nome']} (saiu)",
+                    "total_investido": jogador["total_investido"],
+                    "saldo_final": jogador["saldo"],
+                    "lucro": round(jogador["saldo"] - jogador["total_investido"], 2),
+                }
+            )
+
+        nome = jogador["nome"]
+        mensagens = []
+
+        # Se desconectou durante a distribuição de cartas privadas
+        if self.fase == "DISTRIBUINDO_MAOS" and conn in self.participantes_mao:
+            alvo_atual = self.jogador_alvo_distribuicao()
+            if alvo_atual == conn:
+                for c in self.buffer_cartas:
+                    self.cartas_usadas_rodada.discard(c)
+                self.buffer_cartas.clear()
+            idx_rem = self.participantes_mao.index(conn)
+            self.participantes_mao.remove(conn)
+            if idx_rem < self.indice_distribuicao:
+                self.indice_distribuicao -= 1
+
+            if len(self.participantes_mao) < 2:
+                self.fase = "AGUARDANDO"
+                self.ultima_acao_msg = f"{nome} saiu. Jogadores insuficientes; voltando ao lobby."
+                mensagens.append(("TODOS", "limpar_mesa", {}))
+                mensagens.extend(self._gerar_estado_individualizado(self.ultima_acao_msg))
+                return mensagens
+
+            if self.indice_distribuicao >= len(self.participantes_mao):
+                self.fase = "DISTRIBUINDO_MESA"
+                self.buffer_cartas.clear()
+
+        # Se desconectou durante uma rodada de apostas
+        elif self.fase in ("PRE_FLOP", "FLOP", "TURN", "RIVER") and conn in self.participantes_mao:
+            jogador["ativo"] = False
+            era_vez = (
+                self.participantes_mao
+                and self.participantes_mao[self.indice_turno_mao] == conn
+            )
+            self.agiram_na_street.add(conn)
+            ativos = self._ativos_na_mao()
+
+            if len(ativos) == 1:
+                vencedor_id = ativos[0]
+                vencedor = self.jogadores[vencedor_id]
+                premio = round(self.pote, 2)
+                vencedor["saldo"] = round(vencedor["saldo"] + premio, 2)
+                self.resultado_rodada = [
+                    {
+                        "pote_nome": "Pote Principal",
+                        "valor": premio,
+                        "vencedores": [vencedor["nome"]],
+                        "premio_cada": premio,
+                        "combinacao": "Oponente desconectou",
+                    }
+                ]
+                self.fase = "SHOWDOWN"
+                self.ultima_acao_msg = (
+                    f"{nome} desconectou. {vencedor['nome']} ganhou R$ {fmt_valor(premio)}!"
+                )
+                return self._gerar_estado_individualizado(self.ultima_acao_msg)
+
+            if self._street_encerrada():
+                return self._concluir_street(f"{nome} desconectou.")
+
+            if era_vez:
+                self._avancar_turno()
+
+        self.ultima_acao_msg = f"{nome} saiu da mesa."
+        mensagens.extend(self._gerar_estado_individualizado(self.ultima_acao_msg))
+        return mensagens
+
+    def processar_rebuy(self, conn, valor: float) -> list[tuple]:
+        jogador = self.jogadores.get(conn)
+        if not jogador:
+            return []
+
+        if self.fase not in ("AGUARDANDO", "SHOWDOWN") and jogador["na_mao"]:
+            return [
+                (
+                    conn,
+                    "erro",
+                    {"msg": "Aguarde o fim da rodada atual para fazer Rebuy."},
+                )
+            ]
+
+        valor_f = round(float(valor), 2)
+        if valor_f < SALDO_MIN_REBUY or valor_f > SALDO_MAX_REBUY:
+            return [
+                (
+                    conn,
+                    "erro",
+                    {
+                        "msg": f"Rebuy deve ser entre R$ {fmt_valor(SALDO_MIN_REBUY)} e R$ {fmt_valor(SALDO_MAX_REBUY)}."
+                    },
+                )
+            ]
+
+        jogador["saldo"] = round(jogador["saldo"] + valor_f, 2)
+        jogador["total_investido"] = round(jogador["total_investido"] + valor_f, 2)
+        self.ultima_acao_msg = (
+            f"{jogador['nome']} fez Rebuy de R$ {fmt_valor(valor_f)} "
+            f"(Saldo: R$ {fmt_valor(jogador['saldo'])})."
+        )
+        return self._gerar_estado_individualizado(self.ultima_acao_msg)
+
+    # =========================================================================
+    # INÍCIO DE PARTIDA / NOVA RODADA
+    # =========================================================================
+    def pode_iniciar_rodada(self) -> tuple[bool, str]:
+        aptos = [
+            jid
+            for jid in self.ordem_jogadores
+            if self.jogadores[jid]["saldo"] > 0
+            or (self.jogadores[jid]["is_bot"] and self.bot_ativo)
+        ]
+        if len(aptos) < 2:
+            return False, "Necessário pelo menos 2 jogadores com saldo > R$ 0."
+        return True, ""
+
+    def iniciar_nova_rodada(self) -> list[tuple]:
+        # Rebuy automático do Bot se zerou para não travar os testes
+        if self.bot_ativo and BOT_ID in self.jogadores:
+            bot = self.jogadores[BOT_ID]
+            if bot["saldo"] <= 0:
+                bot["saldo"] = 1000.0
+                bot["total_investido"] = round(bot["total_investido"] + 1000.0, 2)
+
+        aptos = [
+            jid
+            for jid in self.ordem_jogadores
+            if self.jogadores[jid]["saldo"] > 0
+        ]
+        if len(aptos) < 2:
+            self.ultima_acao_msg = "Mínimo 2 jogadores com saldo > R$ 0 para iniciar."
+            return self._gerar_estado_individualizado(self.ultima_acao_msg)
+
+        self.numero_rodada += 1
+        self.cartas_usadas_rodada.clear()
+        self.buffer_cartas.clear()
+        self.cartas_mesa_ocultas.clear()
+        self.cartas_mesa_reveladas.clear()
+        self.resultado_rodada.clear()
+        self.aviso_scanner = ""
+        self.pote = 0.0
+        self.aposta_atual = 0.0
+        self.agiram_na_street.clear()
+
+        for jid in self.ordem_jogadores:
+            j = self.jogadores[jid]
+            j["mao"].clear()
+            j["aposta_rodada"] = 0.0
+            j["contribuicao_mao"] = 0.0
+            j["all_in"] = False
+            if jid in aptos:
+                j["na_mao"] = True
+                j["ativo"] = True
+                j["em_espera"] = False
+                j["jogou_sessao"] = True
+            else:
+                j["na_mao"] = False
+                j["ativo"] = False
+
+        # Rotaciona o Dealer entre os participantes aptos
+        if self.dealer_id in aptos:
+            idx_d = (aptos.index(self.dealer_id) + 1) % len(aptos)
+        else:
+            idx_d = 0
+
+        self.dealer_id = aptos[idx_d]
+
+        # Reordena a lista da mão começando no Dealer (índice 0 = Dealer)
+        self.participantes_mao = aptos[idx_d:] + aptos[:idx_d]
+
+        # Define Small Blind e Big Blind (Heads-Up vs 3+ jogadores)
+        n = len(self.participantes_mao)
+        if n == 2:
+            # Heads-Up: Dealer é SB, outro é BB
+            self.sb_id = self.participantes_mao[0]
+            self.bb_id = self.participantes_mao[1]
+            # Ordem de entrega de cartas: começa pelo BB ou SB (vamos iniciar pelo SB / ordem da mesa)
+            self.ordem_distribuicao = [self.sb_id, self.bb_id]
+        else:
+            self.sb_id = self.participantes_mao[1]
+            self.bb_id = self.participantes_mao[2]
+            # Começa à esquerda do Dealer (SB, BB, ..., Dealer)
+            self.ordem_distribuicao = self.participantes_mao[1:] + [
+                self.participantes_mao[0]
+            ]
+
+        self.indice_distribuicao = 0
+        self.fase = "DISTRIBUINDO_MAOS"
+        nome_primeiro = self.jogadores[self.ordem_distribuicao[0]]["nome"]
+        self.ultima_acao_msg = f"Rodada #{self.numero_rodada}: escaneie 2 cartas para {nome_primeiro}."
+
+        mensagens = [("TODOS", "limpar_mesa", {})]
+        mensagens.extend(self._gerar_estado_individualizado(self.ultima_acao_msg))
+        return mensagens
+
+    # =========================================================================
+    # LEITURA DO SCANNER E CONFIRMAÇÕES DO DEALER
+    # =========================================================================
+    def jogador_alvo_distribuicao(self):
+        if self.fase != "DISTRIBUINDO_MAOS":
+            return None
+        if 0 <= self.indice_distribuicao < len(self.ordem_distribuicao):
+            return self.ordem_distribuicao[self.indice_distribuicao]
+        return None
+
+    def processar_carta_lida(self, carta: str) -> list[tuple]:
+        if self.fase not in ("DISTRIBUINDO_MAOS", "DISTRIBUINDO_MESA"):
+            return []
+
+        if carta in self.cartas_usadas_rodada:
+            self.aviso_scanner = "Carta repetida bloqueada! Passe outra carta."
+            return []
+
+        limite = 2 if self.fase == "DISTRIBUINDO_MAOS" else 5
+        if len(self.buffer_cartas) >= limite:
+            self.aviso_scanner = (
+                f"Limite {limite}/{limite} atingido. Clique em Confirmar ou Limpar."
+            )
+            return []
+
+        self.buffer_cartas.append(carta)
+        self.cartas_usadas_rodada.add(carta)
+        self.aviso_scanner = f"Carta {len(self.buffer_cartas)}/{limite} registrada."
+        return []
+
+    def registrar_aviso_duplicada(self) -> None:
+        if self.fase in ("DISTRIBUINDO_MAOS", "DISTRIBUINDO_MESA"):
+            self.aviso_scanner = "Carta já usada nesta rodada! Troque a carta."
+
+    def limpar_buffer_atual(self) -> None:
+        if self.fase not in ("DISTRIBUINDO_MAOS", "DISTRIBUINDO_MESA"):
+            return
+        for c in self.buffer_cartas:
+            self.cartas_usadas_rodada.discard(c)
+        self.buffer_cartas.clear()
+        self.aviso_scanner = "Leitura limpa. Escaneie novamente."
+
+    def confirmar_distribuicao_atual(self) -> list[tuple]:
+        mensagens = []
+
+        if self.fase == "DISTRIBUINDO_MAOS":
+            if len(self.buffer_cartas) != 2:
+                self.aviso_scanner = "Escaneie as 2 cartas antes de confirmar."
+                return []
+
+            alvo_id = self.jogador_alvo_distribuicao()
+            if alvo_id is None or alvo_id not in self.jogadores:
+                return []
+
+            jogador = self.jogadores[alvo_id]
+            jogador["mao"] = list(self.buffer_cartas)
+            self.buffer_cartas.clear()
+            self.aviso_scanner = ""
+
+            # Envia cartas privadas apenas ao dono (se humano)
+            if not jogador["is_bot"]:
+                for c in jogador["mao"]:
+                    mensagens.append((alvo_id, "carta_mao", {"carta": c}))
+
+            self.indice_distribuicao += 1
+            if self.indice_distribuicao < len(self.ordem_distribuicao):
+                prox_nome = self.jogadores[
+                    self.ordem_distribuicao[self.indice_distribuicao]
+                ]["nome"]
+                self.ultima_acao_msg = f"Cartas entregues. Próximo: {prox_nome}."
+            else:
+                self.fase = "DISTRIBUINDO_MESA"
+                self.ultima_acao_msg = (
+                    "Mãos entregues! Escaneie as 5 cartas da mesa (viradas para baixo)."
+                )
+
+            mensagens.extend(self._gerar_estado_individualizado(self.ultima_acao_msg))
+            return mensagens
+
+        if self.fase == "DISTRIBUINDO_MESA":
+            if len(self.buffer_cartas) != 5:
+                self.aviso_scanner = "Escaneie todas as 5 cartas da mesa antes de confirmar."
+                return []
+
+            # Guarda as 5 cartas viradas para baixo (NÃO envia aos celulares)
+            self.cartas_mesa_ocultas = list(self.buffer_cartas)
+            self.cartas_mesa_reveladas.clear()
+            self.buffer_cartas.clear()
+            self.aviso_scanner = ""
+
+            return self._iniciar_preflop_com_blinds()
+
+        return []
+
+    def _cobrar_blind(self, jid, valor_blind: float) -> float:
+        j = self.jogadores[jid]
+        pago = round(min(valor_blind, j["saldo"]), 2)
+        j["saldo"] = round(j["saldo"] - pago, 2)
+        j["aposta_rodada"] = round(j["aposta_rodada"] + pago, 2)
+        j["contribuicao_mao"] = round(j["contribuicao_mao"] + pago, 2)
+        self.pote = round(self.pote + pago, 2)
+        if j["saldo"] <= 0:
+            j["saldo"] = 0.0
+            j["all_in"] = True
+        return pago
+
+    def _iniciar_preflop_com_blinds(self) -> list[tuple]:
+        self.fase = "PRE_FLOP"
+        self.agiram_na_street.clear()
+        for jid in self.participantes_mao:
+            self.jogadores[jid]["aposta_rodada"] = 0.0
+
+        pago_sb = self._cobrar_blind(self.sb_id, self.small_blind)
+        pago_bb = self._cobrar_blind(self.bb_id, self.big_blind)
+        self.aposta_atual = max(pago_sb, pago_bb)
+
+        sb_nome = self.jogadores[self.sb_id]["nome"]
+        bb_nome = self.jogadores[self.bb_id]["nome"]
+        msg_blinds = (
+            f"Blinds: {sb_nome} (SB R${fmt_valor(pago_sb)}), "
+            f"{bb_nome} (BB R${fmt_valor(pago_bb)})."
+        )
+
+        # Se menos de 2 jogadores podem apostar (all-in já nos blinds), vai virar o Flop
+        if len(self._ativos_que_podem_agir()) <= 1 and self._todos_igualaram_ou_allin():
+            return self._concluir_street(msg_blinds)
+
+        n = len(self.participantes_mao)
+        if n == 2:
+            # Heads-Up Pré-Flop: Dealer/SB (índice 0) age primeiro
+            inicio = 0
+        else:
+            # 3+ jogadores Pré-Flop: UTG (índice 3 % n) age primeiro
+            inicio = 3 % n
+
+        self.indice_turno_mao = inicio
+        if not self._pode_agir(self.participantes_mao[self.indice_turno_mao]):
+            self._avancar_turno()
+
+        self.ultima_acao_msg = msg_blinds
+        return self._gerar_estado_individualizado(msg_blinds)
+
+    # =========================================================================
+    # VIRAR CARTAS COMUNITÁRIAS (CONFIRMAÇÃO DO DEALER)
+    # =========================================================================
+    def confirmar_virar_cartas_mesa(self) -> list[tuple]:
+        mapa = {
+            "AGUARDANDO_VIRAR_FLOP": ("FLOP", 3, "Flop virado!"),
+            "AGUARDANDO_VIRAR_TURN": ("TURN", 4, "Turn virado!"),
+            "AGUARDANDO_VIRAR_RIVER": ("RIVER", 5, "River virado!"),
+        }
+        if self.fase not in mapa:
+            return []
+
+        proxima_fase, total_reveladas, titulo = mapa[self.fase]
+        novas_cartas = self.cartas_mesa_ocultas[
+            len(self.cartas_mesa_reveladas) : total_reveladas
+        ]
+        self.cartas_mesa_reveladas.extend(novas_cartas)
+
+        mensagens = []
+        for c in novas_cartas:
+            mensagens.append(("TODOS", "carta_mesa", {"carta": c}))
+
+        self.fase = proxima_fase
+        self.aposta_atual = 0.0
+        self.agiram_na_street.clear()
+        for jid in self.participantes_mao:
+            if jid in self.jogadores:
+                self.jogadores[jid]["aposta_rodada"] = 0.0
+
+        # Em cenário de All-in (menos de 2 jogadores com fichas para apostar),
+        # avança para pedir ao dealer virar a próxima fase ou ir ao Showdown
+        if len(self._ativos_que_podem_agir()) < 2:
+            mensagens.extend(self._concluir_street(f"{titulo} (All-in na mesa)"))
+            return mensagens
+
+        # Pós-flop: primeiro jogador ativo à esquerda do Dealer (índice 1 em diante)
+        self.indice_turno_mao = 1 % len(self.participantes_mao)
+        if not self._pode_agir(self.participantes_mao[self.indice_turno_mao]):
+            self._avancar_turno()
+
+        self.ultima_acao_msg = f"{titulo} Rodada de apostas."
+        mensagens.extend(self._gerar_estado_individualizado(self.ultima_acao_msg))
+        return mensagens
+
+    # =========================================================================
+    # PROCESSAMENTO DE AÇÕES (FOLD, CHECK, CALL, RAISE, ALL-IN)
+    # =========================================================================
+    def _pode_agir(self, jid) -> bool:
+        j = self.jogadores.get(jid)
+        return bool(j and j["na_mao"] and j["ativo"] and not j["all_in"] and j["saldo"] > 0)
+
+    def _ativos_na_mao(self) -> list:
+        return [
+            jid
+            for jid in self.participantes_mao
+            if jid in self.jogadores and self.jogadores[jid]["ativo"]
+        ]
+
+    def _ativos_que_podem_agir(self) -> list:
+        return [jid for jid in self.participantes_mao if self._pode_agir(jid)]
+
+    def _todos_igualaram_ou_allin(self) -> bool:
+        for jid in self._ativos_na_mao():
+            j = self.jogadores[jid]
+            if not j["all_in"] and j["aposta_rodada"] < self.aposta_atual:
+                return False
+        return True
+
+    def _street_encerrada(self) -> bool:
+        podem_agir = self._ativos_que_podem_agir()
+        if not podem_agir:
+            return True
+        if not self._todos_igualaram_ou_allin():
+            return False
+        return all(jid in self.agiram_na_street for jid in podem_agir)
+
+    def jogador_da_vez_id(self):
+        if self.fase not in ("PRE_FLOP", "FLOP", "TURN", "RIVER"):
+            return None
+        if not self.participantes_mao:
+            return None
+        jid = self.participantes_mao[self.indice_turno_mao]
+        return jid if self._pode_agir(jid) else None
+
+    def jogador_da_vez_eh_bot(self) -> bool:
+        return self.jogador_da_vez_id() == BOT_ID
+
+    def processar_acao(self, conn, acao: str, valor: float = 0.0) -> list[tuple]:
+        if self.fase not in ("PRE_FLOP", "FLOP", "TURN", "RIVER"):
+            return []
+        if conn not in self.jogadores:
+            return []
+        if self.jogador_da_vez_id() != conn:
+            return [(conn, "erro", {"msg": "Não é a sua vez!"})]
+
+        j = self.jogadores[conn]
+        nome = j["nome"]
+        a_pagar = round(max(0.0, self.aposta_atual - j["aposta_rodada"]), 2)
+        aviso = ""
+
+        if acao == "fold":
+            j["ativo"] = False
+            self.agiram_na_street.add(conn)
+            aviso = f"{nome} correu (Fold)."
+
+        elif acao == "check":
+            if a_pagar > 0:
+                return [
+                    (
+                        conn,
+                        "erro",
+                        {"msg": f"Precisa pagar R$ {fmt_valor(a_pagar)} ou correr."},
+                    )
+                ]
+            self.agiram_na_street.add(conn)
+            aviso = f"{nome} passou (Check)."
+
+        elif acao == "call":
+            pagamento = round(min(a_pagar, j["saldo"]), 2)
+            j["saldo"] = round(j["saldo"] - pagamento, 2)
+            j["aposta_rodada"] = round(j["aposta_rodada"] + pagamento, 2)
+            j["contribuicao_mao"] = round(j["contribuicao_mao"] + pagamento, 2)
+            self.pote = round(self.pote + pagamento, 2)
+            if j["saldo"] <= 0:
+                j["saldo"] = 0.0
+                j["all_in"] = True
+                aviso = f"{nome} deu ALL-IN pagando R$ {fmt_valor(pagamento)}!"
+            else:
+                aviso = f"{nome} pagou R$ {fmt_valor(pagamento)} (Call)."
+            self.agiram_na_street.add(conn)
+
+        elif acao == "all_in":
+            pagamento = round(j["saldo"], 2)
+            if pagamento <= 0:
+                return [(conn, "erro", {"msg": "Saldo insuficiente."})]
+            j["saldo"] = 0.0
+            j["aposta_rodada"] = round(j["aposta_rodada"] + pagamento, 2)
+            j["contribuicao_mao"] = round(j["contribuicao_mao"] + pagamento, 2)
+            self.pote = round(self.pote + pagamento, 2)
+            j["all_in"] = True
+            if j["aposta_rodada"] > self.aposta_atual:
+                self.aposta_atual = j["aposta_rodada"]
+                self.agiram_na_street = {conn}
+            else:
+                self.agiram_na_street.add(conn)
+            aviso = f"{nome} foi ALL-IN (R$ {fmt_valor(j['aposta_rodada'])})!"
+
+        elif acao == "raise":
+            valor_extra = round(float(valor), 2)
+            total_necessario = round(a_pagar + valor_extra, 2)
+            if valor_extra <= 0:
+                return [(conn, "erro", {"msg": "Digite um valor maior que zero."})]
+            if j["saldo"] < total_necessario:
+                return [
+                    (
+                        conn,
+                        "erro",
+                        {"msg": "Saldo insuficiente para esse Raise. Use All-In."},
+                    )
+                ]
+            j["saldo"] = round(j["saldo"] - total_necessario, 2)
+            j["aposta_rodada"] = round(j["aposta_rodada"] + total_necessario, 2)
+            j["contribuicao_mao"] = round(j["contribuicao_mao"] + total_necessario, 2)
+            self.pote = round(self.pote + total_necessario, 2)
+            self.aposta_atual = j["aposta_rodada"]
+            self.agiram_na_street = {conn}
+            if j["saldo"] <= 0:
+                j["saldo"] = 0.0
+                j["all_in"] = True
+                aviso = f"{nome} aumentou em ALL-IN para R$ {fmt_valor(self.aposta_atual)}!"
+            else:
+                aviso = f"{nome} aumentou para R$ {fmt_valor(self.aposta_atual)} (Raise)!"
+        else:
+            return []
+
+        ativos = self._ativos_na_mao()
+        if len(ativos) == 1:
+            vencedor_id = ativos[0]
+            vencedor = self.jogadores[vencedor_id]
+            premio = round(self.pote, 2)
+            vencedor["saldo"] = round(vencedor["saldo"] + premio, 2)
+            self.resultado_rodada = [
+                {
+                    "pote_nome": "Pote Principal",
+                    "valor": premio,
+                    "vencedores": [vencedor["nome"]],
+                    "premio_cada": premio,
+                    "combinacao": "Todos os outros correram",
+                }
+            ]
+            self.fase = "SHOWDOWN"
+            self.ultima_acao_msg = (
+                f"{aviso} {vencedor['nome']} ganhou R$ {fmt_valor(premio)}!"
+            )
+            return self._gerar_estado_individualizado(self.ultima_acao_msg)
+
+        if self._street_encerrada():
+            return self._concluir_street(aviso)
+
+        self._avancar_turno()
+        self.ultima_acao_msg = aviso
+        return self._gerar_estado_individualizado(aviso)
+
+    def _avancar_turno(self) -> None:
+        total = len(self.participantes_mao)
+        for _ in range(total):
+            self.indice_turno_mao = (self.indice_turno_mao + 1) % total
+            if self._pode_agir(self.participantes_mao[self.indice_turno_mao]):
+                break
+
+    def _concluir_street(self, ultimo_aviso: str) -> list[tuple]:
+        transicoes = {
+            "PRE_FLOP": ("AGUARDANDO_VIRAR_FLOP", "Aguardando dealer virar o Flop (3 cartas)."),
+            "FLOP": ("AGUARDANDO_VIRAR_TURN", "Aguardando dealer virar o Turn (4ª carta)."),
+            "TURN": ("AGUARDANDO_VIRAR_RIVER", "Aguardando dealer virar o River (5ª carta)."),
+            "RIVER": ("SHOWDOWN", ""),
+        }
+        nova_fase, texto = transicoes[self.fase]
+        self.fase = nova_fase
+
+        if nova_fase == "SHOWDOWN":
+            return self._avaliar_showdown(ultimo_aviso)
+
+        self.ultima_acao_msg = f"{ultimo_aviso} {texto}"
+        return self._gerar_estado_individualizado(self.ultima_acao_msg)
+
+    # =========================================================================
+    # SIDE POTS E SHOWDOWN
+    # =========================================================================
+    def calcular_potes(self) -> list[dict]:
+        """Calcula Main Pot e Side Pots considerando contribuições totais na mão."""
+        contribuidores_todos = [
+            jid
+            for jid in self.participantes_mao
+            if jid in self.jogadores and self.jogadores[jid]["contribuicao_mao"] > 0
+        ]
+        niveis = sorted(
+            {self.jogadores[jid]["contribuicao_mao"] for jid in contribuidores_todos}
+        )
+
+        potes: list[dict] = []
+        nivel_ant = 0.0
+
+        for nivel in niveis:
+            delta = round(nivel - nivel_ant, 2)
+            if delta <= 0:
+                continue
+            participam_camada = [
+                jid
+                for jid in contribuidores_todos
+                if self.jogadores[jid]["contribuicao_mao"] >= nivel
+            ]
+            valor_camada = round(delta * len(participam_camada), 2)
+            elegiveis = [
+                jid for jid in participam_camada if self.jogadores[jid]["ativo"]
+            ]
+
+            if not elegiveis:
+                if potes:
+                    potes[-1]["valor"] = round(potes[-1]["valor"] + valor_camada, 2)
+            elif potes and set(potes[-1]["elegiveis"]) == set(elegiveis):
+                potes[-1]["valor"] = round(potes[-1]["valor"] + valor_camada, 2)
+            else:
+                potes.append({"valor": valor_camada, "elegiveis": elegiveis})
+
+            nivel_ant = nivel
+
+        return potes
+
+    def _avaliar_showdown(self, ultimo_aviso: str) -> list[tuple]:
+        board_treys = [Card.new(c) for c in self.cartas_mesa_reveladas]
+        scores: dict = {}
+        classes_pt: dict = {}
+
+        for jid in self._ativos_na_mao():
+            j = self.jogadores[jid]
+            if len(j["mao"]) < 2:
+                continue
+            mao_treys = [Card.new(c) for c in j["mao"]]
+            score = self.evaluator.evaluate(board_treys, mao_treys)
+            classe_en = self.evaluator.class_to_string(
+                self.evaluator.get_rank_class(score)
+            )
+            scores[jid] = score
+            classes_pt[jid] = TRADUCAO_MAOS.get(classe_en, classe_en)
+
+        potes = self.calcular_potes()
+        self.resultado_rodada = []
+        resumo_msgs = []
+        idx_side = 0
+
+        for i, pote_info in enumerate(potes):
+            valor_pote = pote_info["valor"]
+            elegiveis = [jid for jid in pote_info["elegiveis"] if jid in scores]
+            if not elegiveis:
+                continue
+
+            # Excesso não pago (apenas 1 jogador contribuiu nesse nível)
+            if len(elegiveis) == 1:
+                jid_unico = elegiveis[0]
+                self.jogadores[jid_unico]["saldo"] = round(
+                    self.jogadores[jid_unico]["saldo"] + valor_pote, 2
+                )
+                self.resultado_rodada.append(
+                    {
+                        "pote_nome": "Excesso devolvido",
+                        "valor": valor_pote,
+                        "vencedores": [self.jogadores[jid_unico]["nome"]],
+                        "premio_cada": valor_pote,
+                        "combinacao": "Aposta não coberta",
+                    }
+                )
+                continue
+
+            melhor_score = min(scores[jid] for jid in elegiveis)
+            vencedores_ids = [
+                jid for jid in elegiveis if scores[jid] == melhor_score
+            ]
+            premio_cada = round(valor_pote / len(vencedores_ids), 2)
+
+            # Ajuste fino de eventual centavo residual para o primeiro vencedor
+            resto = round(valor_pote - premio_cada * len(vencedores_ids), 2)
+            for k, vid in enumerate(vencedores_ids):
+                bonus = resto if k == 0 else 0.0
+                self.jogadores[vid]["saldo"] = round(
+                    self.jogadores[vid]["saldo"] + premio_cada + bonus, 2
+                )
+
+            nome_pote = "Pote Principal" if i == 0 else f"Side Pot {idx_side + 1}"
+            if i > 0:
+                idx_side += 1
+
+            nomes_v = [self.jogadores[vid]["nome"] for vid in vencedores_ids]
+            comb = classes_pt[vencedores_ids[0]]
+
+            self.resultado_rodada.append(
+                {
+                    "pote_nome": nome_pote,
+                    "valor": valor_pote,
+                    "vencedores": nomes_v,
+                    "premio_cada": premio_cada,
+                    "combinacao": comb,
+                }
+            )
+            resumo_msgs.append(
+                f"{nome_pote}: {', '.join(nomes_v)} levou R$ {fmt_valor(premio_cada)} ({comb})"
+            )
+
+        resumo_str = " | ".join(resumo_msgs) if resumo_msgs else "Rodada finalizada."
+        self.ultima_acao_msg = f"SHOWDOWN! {resumo_str}"
+        return self._gerar_estado_individualizado(self.ultima_acao_msg)
+
+    # =========================================================================
+    # ENCERRAR JOGO (PLACAR FINAL) E VOLTAR AO INÍCIO
+    # =========================================================================
+    def encerrar_jogo(self) -> list[tuple]:
+        ranking = []
+        for jid in self.ordem_jogadores:
+            j = self.jogadores[jid]
+            ranking.append(
+                {
+                    "nome": j["nome"],
+                    "total_investido": round(j["total_investido"], 2),
+                    "saldo_final": round(j["saldo"], 2),
+                    "lucro": round(j["saldo"] - j["total_investido"], 2),
+                }
+            )
+        ranking.extend(self.historico_desconectados)
+        ranking.sort(key=lambda item: (item["lucro"], item["saldo_final"]), reverse=True)
+
+        self.placar_final = ranking
+        self.fase = "PLACAR_FINAL"
+        self.ultima_acao_msg = "Partida encerrada! Veja o placar final."
+
+        mensagens = [("TODOS", "placar_final", {"ranking": ranking})]
+        mensagens.extend(self._gerar_estado_individualizado(self.ultima_acao_msg))
+        return mensagens
+
+    def voltar_ao_inicio(self) -> list[tuple]:
+        self.fase = "AGUARDANDO"
+        self.numero_rodada = 0
+        self.dealer_id = None
+        self.sb_id = None
+        self.bb_id = None
+        self.participantes_mao.clear()
+        self.cartas_usadas_rodada.clear()
+        self.buffer_cartas.clear()
+        self.cartas_mesa_ocultas.clear()
+        self.cartas_mesa_reveladas.clear()
+        self.resultado_rodada.clear()
+        self.placar_final.clear()
+        self.historico_desconectados.clear()
+        self.pote = 0.0
+        self.aposta_atual = 0.0
+        self.agiram_na_street.clear()
+        self.aviso_scanner = ""
+
+        # Reinicia o ponto de referência financeiro para uma nova sessão
+        for jid in self.ordem_jogadores:
+            j = self.jogadores[jid]
+            if j["is_bot"] and j["saldo"] <= 0:
+                j["saldo"] = 1000.0
+            j["saldo_inicial"] = j["saldo"]
+            j["total_investido"] = j["saldo"]
+            j["mao"].clear()
+            j["aposta_rodada"] = 0.0
+            j["contribuicao_mao"] = 0.0
+            j["ativo"] = False
+            j["all_in"] = False
+            j["na_mao"] = False
+            j["em_espera"] = False
+            j["jogou_sessao"] = False
+
+        self.ultima_acao_msg = "Nova mesa aberta! Aguardando jogadores..."
+        mensagens = [("TODOS", "mesa_reiniciada", {})]
+        mensagens.extend(self._gerar_estado_individualizado(self.ultima_acao_msg))
+        return mensagens
+
+    # =========================================================================
+    # IA DO BOT DE TESTES
+    # =========================================================================
+    def escolher_acao_bot(self) -> tuple[str, float]:
+        bot = self.jogadores.get(BOT_ID)
+        if not bot:
+            return "fold", 0.0
+
+        a_pagar = round(max(0.0, self.aposta_atual - bot["aposta_rodada"]), 2)
+        saldo = bot["saldo"]
+
+        # Avalia força da mão (0.0 fraca -> 1.0 muito forte)
+        forca = 0.45
+        if len(bot["mao"]) == 2:
+            if len(self.cartas_mesa_reveladas) >= 3:
+                board = [Card.new(c) for c in self.cartas_mesa_reveladas]
+                mao = [Card.new(c) for c in bot["mao"]]
+                score = self.evaluator.evaluate(board, mao)
+                forca = max(0.05, min(1.0, 1.0 - (score / 7462.0)))
+            else:
+                mapa_v = {"2": 2, "3": 3, "4": 4, "5": 5, "6": 6, "7": 7, "8": 8,
+                          "9": 9, "T": 10, "J": 11, "Q": 12, "K": 13, "A": 14}
+                v1 = mapa_v.get(bot["mao"][0][0], 7)
+                v2 = mapa_v.get(bot["mao"][1][0], 7)
+                mesmo_naipe = bot["mao"][0][1] == bot["mao"][1][1]
+                if v1 == v2:
+                    forca = 0.68 + (v1 / 50.0)
+                else:
+                    forca = ((v1 + v2) / 36.0) + (0.08 if mesmo_naipe else 0.0)
+
+        sorteio = random.random()
+
+        if a_pagar == 0:
+            if forca > 0.72 and saldo >= self.big_blind and sorteio < 0.65:
+                aumento = min(self.big_blind * 2, saldo)
+                return "raise", aumento
+            return "check", 0.0
+
+        # Há aposta a cobrir
+        if forca < 0.32 and a_pagar > self.big_blind * 2 and sorteio < 0.70:
+            return "fold", 0.0
+
+        if forca > 0.80 and saldo > a_pagar + self.big_blind and sorteio < 0.45:
+            aumento = min(self.big_blind * 2, saldo - a_pagar)
+            return "raise", aumento
+
+        return "call", 0.0
+
+    # =========================================================================
+    # SNAPSHOTS PARA INTERFACE LCD E CELULARES
+    # =========================================================================
+    def montante_total_mesa(self) -> float:
+        return round(
+            sum(self.jogadores[jid]["saldo"] for jid in self.ordem_jogadores)
+            + self.pote,
+            2,
+        )
+
+    def obter_snapshot_ui(self) -> dict:
+        alvo_id = self.jogador_alvo_distribuicao()
+        jogadores_lista = []
+        for idx, jid in enumerate(self.ordem_jogadores):
+            j = self.jogadores[jid]
+            tags = []
+            if jid == self.dealer_id:
+                tags.append("D")
+            if jid == self.sb_id:
+                tags.append("SB")
+            if jid == self.bb_id:
+                tags.append("BB")
+
+            if j["em_espera"]:
+                status = "ESPERA"
+            elif not j["na_mao"] and self.fase != "AGUARDANDO":
+                status = "FORA (R$0)" if j["saldo"] <= 0 else "FORA"
+            elif j["all_in"]:
+                status = "ALL-IN"
+            elif j["ativo"]:
+                status = "ATIVO"
+            elif self.fase == "AGUARDANDO":
+                status = "PRONTO"
+            else:
+                status = "FOLD"
+
+            jogadores_lista.append(
+                {
+                    "id": jid,
+                    "pos": idx + 1,
+                    "nome": j["nome"],
+                    "is_bot": j["is_bot"],
+                    "saldo": j["saldo"],
+                    "aposta_rodada": j["aposta_rodada"],
+                    "tags": "/".join(tags),
+                    "status": status,
+                    "eh_vez": (jid == self.jogador_da_vez_id()),
+                }
+            )
+
+        potes = self.calcular_potes() if self.pote > 0 else []
+        pode_iniciar, motivo_bloqueio = self.pode_iniciar_rodada()
+
+        return {
+            "fase": self.fase,
+            "numero_rodada": self.numero_rodada,
+            "small_blind": self.small_blind,
+            "big_blind": self.big_blind,
+            "bot_ativo": self.bot_ativo,
+            "pote": self.pote,
+            "qtd_side_pots": max(0, len(potes) - 1),
+            "aposta_atual": self.aposta_atual,
+            "montante_total": self.montante_total_mesa(),
+            "jogadores": jogadores_lista,
+            "pode_iniciar": pode_iniciar,
+            "motivo_bloqueio": motivo_bloqueio,
+            "alvo_nome": self.jogadores[alvo_id]["nome"] if alvo_id in self.jogadores else "",
+            "alvo_idx": self.indice_distribuicao + 1,
+            "alvo_total": len(getattr(self, "ordem_distribuicao", [])),
+            "buffer_qtd": len(self.buffer_cartas),
+            "aviso_scanner": self.aviso_scanner,
+            "cartas_mesa_reveladas": list(self.cartas_mesa_reveladas),
+            "jogador_vez_nome": (
+                self.jogadores[self.jogador_da_vez_id()]["nome"]
+                if self.jogador_da_vez_id() in self.jogadores
+                else "-"
+            ),
+            "ultima_acao_msg": self.ultima_acao_msg,
+            "resultado_rodada": list(self.resultado_rodada),
+            "placar_final": list(self.placar_final),
+        }
+
+    def _gerar_estado_individualizado(self, msg: str) -> list[tuple]:
+        vez_id = self.jogador_da_vez_id()
+        nome_vez = self.jogadores[vez_id]["nome"] if vez_id in self.jogadores else "-"
+        potes = self.calcular_potes() if self.pote > 0 else []
+        qtd_side_pots = max(0, len(potes) - 1)
+
+        mensagens = []
+        for jid in self.ordem_jogadores:
+            j = self.jogadores[jid]
+            if j["is_bot"]:
+                continue
+
+            a_pagar = (
+                round(max(0.0, self.aposta_atual - j["aposta_rodada"]), 2)
+                if j["na_mao"] and j["ativo"]
+                else 0.0
+            )
+            tags = []
+            if jid == self.dealer_id:
+                tags.append("D")
+            if jid == self.sb_id:
+                tags.append("SB")
+            if jid == self.bb_id:
+                tags.append("BB")
+
+            pode_rebuy = (
+                self.fase in ("AGUARDANDO", "SHOWDOWN") or not j["na_mao"]
+            ) and self.fase != "PLACAR_FINAL"
+
+            dados = {
+                "fase": self.fase,
+                "pote": self.pote,
+                "qtd_side_pots": qtd_side_pots,
+                "seu_saldo": j["saldo"],
+                "a_pagar": a_pagar,
+                "min_raise": self.big_blind,
+                "sua_vez": (jid == vez_id),
+                "jogador_vez": nome_vez,
+                "papel": "/".join(tags),
+                "em_espera": j["em_espera"],
+                "pode_rebuy": pode_rebuy,
+                "small_blind": self.small_blind,
+                "big_blind": self.big_blind,
+                "msg": msg,
+            }
+            mensagens.append((jid, "estado_mesa", dados))
+        return mensagens
+
+=== ./servidor_pi/teste_scanner_visual.py ===
+import time
+from pathlib import Path
+import cv2
+import numpy as np
+from gpiozero import DigitalInputDevice, DigitalOutputDevice
+from picamera2 import Picamera2
+
+# ==============================================================================
+# CONFIGURAÇÕES E CALIBRAÇÃO
+# ==============================================================================
+# Se o IR estiver indicando "CARTA" quando vazio e "VAZIO" com carta, mude para False
+IR_ATIVO_EM_HIGH = False
+
+# Pinos BCM (físicos: 11 -> GPIO 17, 13 -> GPIO 27, 15 -> GPIO 22)
+PINO_LED = 17
+PINO_VCC_IR = 27
+PINO_DO_IR = 22
+
+# Configurações de ROI (x, y, largura, altura) e visão computacional
+ROI_NUMERO = (179, 250, 79, 101)
+ROI_NAIPE = (179, 352, 82, 86)
+
+LIMIAR_PRESENCA = 120.0
+LIMIAR_VERMELHO = 30.0
+AREA_MIN = 15.0
+LADO = 32
+
+NOMES_VALORES = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
+NOMES_NAIPES_VERMELHOS = ["Copas", "Ouros"]
+NOMES_NAIPES_PRETOS = ["Espadas", "Paus"]
+
+TEMPO_ESTABILIZACAO = (
+    0.40  # Segundos de espera após o IR detectar (para você encostar a carta)
+)
+VOTOS_NECESSARIOS = 7  # Quantos frames idênticos seguidos para confirmar a carta
+
+
+def orientar(bruto):
+    girado = cv2.rotate(bruto, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    return cv2.flip(girado, 1)
+
+
+def calcular_hog(img):
+    hog = cv2.HOGDescriptor((32, 32), (16, 16), (8, 8), (8, 8), 9)
+    return hog.compute(img).reshape(1, -1)
+
+
+def extrair_simbolo(recorte):
+    cinza = cv2.cvtColor(recorte, cv2.COLOR_BGR2GRAY)
+    if cv2.mean(cinza)[0] < LIMIAR_PRESENCA:
+        return None
+
+    cinza_blur = cv2.GaussianBlur(cinza, (3, 3), 0)
+    _, binaria = cv2.threshold(
+        cinza_blur, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU
+    )
+
+    contornos, _ = cv2.findContours(binaria, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    area_max = 0.5 * recorte.size / 3
+    x_min, y_min, x_max, y_max = 9999, 9999, -1, -1
+    achou = False
+
+    for c in contornos:
+        a = cv2.contourArea(c)
+        if a < AREA_MIN or a > area_max:
+            continue
+        x, y, w, h = cv2.boundingRect(c)
+        x_min = min(x_min, x)
+        y_min = min(y_min, y)
+        x_max = max(x_max, x + w)
+        y_max = max(y_max, y + h)
+        achou = True
+
+    if not achou:
+        return None
+
+    tinta = binaria[y_min:y_max, x_min:x_max]
+    lado_sq = max(tinta.shape[1], tinta.shape[0])
+    margem = max(2, lado_sq // 8)
+
+    quadrado = np.zeros((lado_sq + 2 * margem, lado_sq + 2 * margem), dtype=np.uint8)
+    ox = margem + (lado_sq - tinta.shape[1]) // 2
+    oy = margem + (lado_sq - tinta.shape[0]) // 2
+    quadrado[oy : oy + tinta.shape[0], ox : ox + tinta.shape[1]] = tinta
+
+    img_redim = cv2.resize(quadrado, (LADO, LADO), interpolation=cv2.INTER_AREA)
+
+    mascara = binaria[y_min:y_max, x_min:x_max]
+    recorte_roi = recorte[y_min:y_max, x_min:x_max]
+    media_bgr = cv2.mean(recorte_roi, mask=mascara)
+    vermelho = (media_bgr[2] - 0.5 * (media_bgr[0] + media_bgr[1])) > LIMIAR_VERMELHO
+
+    return img_redim, vermelho
+
+
+def prever(modelo, nomes, img):
+    caracteristicas = np.float32(calcular_hog(img))
+    _, r = modelo.predict(caracteristicas)
+    i = int(r[0][0])
+    return nomes[i] if 0 <= i < len(nomes) else "?"
+
+
+def main():
+    print("=== INICIANDO TESTE DE HARDWARE E RECONHECIMENTO ===")
+
+    # 1. Carregamento dos modelos SVM
+    pasta_modelos = Path(__file__).resolve().parent / "modelos"
+    try:
+        svm_valores = cv2.ml.SVM_load(str(pasta_modelos / "modelo_valores.xml"))
+        svm_vermelhos = cv2.ml.SVM_load(
+            str(pasta_modelos / "modelo_naipes_vermelhos.xml")
+        )
+        svm_pretos = cv2.ml.SVM_load(str(pasta_modelos / "modelo_naipes_pretos.xml"))
+        if svm_valores.empty() or svm_vermelhos.empty() or svm_pretos.empty():
+            raise FileNotFoundError("Um ou mais arquivos XML estão vazios ou ausentes.")
+        print("[OK] Modelos SVM carregados com sucesso.")
+    except Exception as e:
+        print(f"[ERRO] Falha ao carregar modelos XML: {e}")
+        return
+
+    # 2. Inicialização dos pinos GPIO (LED + IR)
+    led = DigitalOutputDevice(PINO_LED, initial_value=False)
+    vcc_ir = DigitalOutputDevice(PINO_VCC_IR, initial_value=False)
+    sensor_ir = DigitalInputDevice(
+        PINO_DO_IR, pull_up=None, active_state=IR_ATIVO_EM_HIGH
+    )
+
+    led.on()
+    vcc_ir.on()
+    time.sleep(0.1)
+    print(f"[OK] LED (GPIO {PINO_LED}) e VCC do IR (GPIO {PINO_VCC_IR}) LIGADOS.")
+
+    # 3. Inicialização da Câmera CSI
+    cap = Picamera2()
+    cap.configure(
+        cap.create_video_configuration(main={"size": (640, 480), "format": "RGB888"})
+    )
+    cap.start()
+    time.sleep(1.0)
+    print("[OK] Câmera CSI iniciada.")
+    print("\nControles na janela de vídeo:")
+    print("  [Q] -> Sair do teste")
+    print("  [I] -> Inverter lógica do sensor IR em tempo real\n")
+
+    estado_ir_anterior = None
+    momento_deteccao_ir = 0.0
+    candidata_atual = None
+    votos = 0
+    carta_confirmada = False
+
+    rx, ry, rw, rh = ROI_NUMERO
+    nx, ny, nw, nh = ROI_NAIPE
+
+    try:
+        while True:
+            carta_presente = sensor_ir.is_active
+
+            # 1. Detectou mudança no sensor IR
+            if carta_presente != estado_ir_anterior:
+                if carta_presente:
+                    momento_deteccao_ir = time.monotonic()
+                    print(">>> [IR] Carta entrou! Aguardando estabilizar no canto...")
+                else:
+                    print("--- [IR] Scanner vazio (carta removida).\n")
+                # Reseta os contadores sempre que entra ou sai carta
+                candidata_atual = None
+                votos = 0
+                carta_confirmada = False
+                estado_ir_anterior = carta_presente
+
+            bruto = cap.capture_array("main")
+            frame = orientar(bruto)
+            frame_debug = frame.copy()
+
+            cv2.rectangle(frame_debug, (rx, ry), (rx + rw, ry + rh), (255, 0, 0), 2)
+            cv2.rectangle(frame_debug, (nx, ny), (nx + nw, ny + nh), (0, 0, 255), 2)
+
+            texto_carta = "Aguardando IR..."
+            cor_status = (0, 165, 255)  # Laranja
+
+            if carta_presente:
+                tempo_decorrido = time.monotonic() - momento_deteccao_ir
+
+                # 2. Aguarda você terminar de deslizar a carta até o canto
+                if tempo_decorrido < TEMPO_ESTABILIZACAO:
+                    texto_carta = "Estabilizando carta..."
+                    cor_status = (0, 255, 255)  # Amarelo
+
+                # 3. Se já confirmou esta carta, não lê de novo até você tirar ela
+                elif carta_confirmada:
+                    texto_carta = (
+                        f"CONFIRMADA: {candidata_atual[0]} de {candidata_atual[1]}"
+                    )
+                    cor_status = (0, 255, 0)  # Verde
+
+                # 4. Faz a leitura e acumula votos até confirmar
+                else:
+                    rec_num = frame[ry : ry + rh, rx : rx + rw]
+                    rec_nai = frame[ny : ny + nh, nx : nx + nw]
+
+                    res_v = extrair_simbolo(rec_num)
+                    res_n = extrair_simbolo(rec_nai)
+
+                    valor = (
+                        prever(svm_valores, NOMES_VALORES, res_v[0])
+                        if res_v is not None
+                        else "?"
+                    )
+                    naipe = "?"
+                    if res_n is not None:
+                        img_n, is_red = res_n
+                        naipe = (
+                            prever(svm_vermelhos, NOMES_NAIPES_VERMELHOS, img_n)
+                            if is_red
+                            else prever(svm_pretos, NOMES_NAIPES_PRETOS, img_n)
+                        )
+
+                    if valor != "?" and naipe != "?":
+                        leitura = (valor, naipe)
+                        if leitura == candidata_atual:
+                            votos += 1
+                        else:
+                            candidata_atual = leitura
+                            votos = 1
+
+                        texto_carta = f"Validando: {valor} de {naipe} ({votos}/{VOTOS_NECESSARIOS})"
+                        cor_status = (0, 255, 255)
+
+                        if votos >= VOTOS_NECESSARIOS:
+                            carta_confirmada = True
+                            print(
+                                f"    [CONFIRMADA] Carta lida com segurança: {valor} de {naipe}"
+                            )
+                    else:
+                        candidata_atual = None
+                        votos = 0
+                        texto_carta = "Ajuste a carta no quadro..."
+
+            status_ir_txt = "IR: CARTA DETECTADA" if carta_presente else "IR: VAZIO"
+            cv2.putText(
+                frame_debug,
+                status_ir_txt,
+                (15, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                cor_status,
+                2,
+            )
+            cv2.putText(
+                frame_debug,
+                texto_carta,
+                (15, 65),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                cor_status,
+                2,
+            )
+            cv2.imshow("Teste Scanner - Camera, IR e SVM", frame_debug)
+
+            tecla = cv2.waitKey(30) & 0xFF
+            if tecla == ord("q"):
+                break
+            elif tecla == ord("i"):
+                novo_estado = not sensor_ir.active_state
+                sensor_ir.close()
+                sensor_ir = DigitalInputDevice(
+                    PINO_DO_IR, pull_up=None, active_state=novo_estado
+                )
+                estado_ir_anterior = None
+                print(f"[CONFIG] Lógica do IR invertida (active_state={novo_estado})")
+
+    except KeyboardInterrupt:
+        print("\nInterrompido pelo usuário.")
+    finally:
+        print("Desligando LED, IR e câmera...")
+        cap.stop()
+        cap.close()
+        led.off()
+        vcc_ir.off()
+        led.close()
+        vcc_ir.close()
+        sensor_ir.close()
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
+
+=== ./servidor_pi/protocolo.py ===
+import json
+
+
+def empacotar(tipo: str, **dados) -> bytes:
+    """Cria uma mensagem padronizada no formato {'tipo': ..., 'dados': {...}}\n."""
+    envelope = {"tipo": tipo, "dados": dados}
+    return (json.dumps(envelope, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def desempacotar(linha: str) -> tuple[str, dict]:
+    """Extrai (tipo, dados) de uma linha JSON recebida pelo socket."""
+    envelope = json.loads(linha)
+    return envelope.get("tipo", ""), envelope.get("dados", {})
+
+=== ./servidor_pi/pyproject.toml ===
+[project]
+name = "servidor-poker-pi"
+version = "0.1.0"
+description = "Servidor de rede, regras de poker e scanner de cartas no Raspberry Pi"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "treys",
+]
+
+[tool.uv]
+system-site-packages = true
+
+=== ./servidor_pi/scanner_integrado.py ===
+import sys
+import threading
+import time
+from pathlib import Path
+import cv2
+import numpy as np
+from gpiozero import DigitalInputDevice, DigitalOutputDevice
+
+# ==============================================================================
+# CONFIGURAÇÕES DE HARDWARE E CALIBRAÇÃO
+# ==============================================================================
+IR_ATIVO_EM_HIGH = False
+
+# Pinos BCM (físicos: 11 -> GPIO 17, 13 -> GPIO 27, 15 -> GPIO 22)
+PINO_LED = 17
+PINO_VCC_IR = 27
+PINO_DO_IR = 22
+
+TEMPO_ESTABILIZACAO = 0.40
+VOTOS_NECESSARIOS = 7
+
+ROI_NUMERO = (179, 250, 79, 101)
+ROI_NAIPE = (179, 352, 82, 86)
+
+LIMIAR_PRESENCA = 120.0
+LIMIAR_VERMELHO = 30.0
+AREA_MIN = 15.0
+LADO = 32
+
+NOMES_VALORES = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
+NOMES_NAIPES_VERMELHOS = ["Copas", "Ouros"]
+NOMES_NAIPES_PRETOS = ["Espadas", "Paus"]
+
+MAPA_VALORES = {"10": "T", "A": "A", "J": "J", "Q": "Q", "K": "K"}
+MAPA_NAIPES = {"Copas": "h", "Ouros": "d", "Espadas": "s", "Paus": "c"}
+
+lock_estado = threading.Lock()
+estado = {
+    "quer_camera": False,
+    "rodando": True,
+    "cartas_usadas": set(),
+    "resetar_leitura": False,
+}
+
+HOG_DESCRIPTOR = cv2.HOGDescriptor((32, 32), (16, 16), (8, 8), (8, 8), 9)
+
+
+def calcular_hog(img):
+    return HOG_DESCRIPTOR.compute(img).reshape(1, -1)
+
+
+def traduzir_codigo(valor: str, naipe: str) -> str:
+    v = MAPA_VALORES.get(valor, valor)
+    n = MAPA_NAIPES.get(naipe, "")
+    return f"{v}{n}"
+
+
+def log(msg: str) -> None:
+    print(msg, file=sys.stderr, flush=True)
+
+
+def evento(msg: str) -> None:
+    print(msg, flush=True)
+
+
+class HardwareScanner:
+    def __init__(
+        self, pino_led: int, pino_vcc_ir: int, pino_do_ir: int, ativo_high: bool
+    ):
+        self.ativo = False
+        try:
+            self.led = DigitalOutputDevice(pino_led, initial_value=False)
+            self.vcc_ir = DigitalOutputDevice(pino_vcc_ir, initial_value=False)
+            self.sensor_ir = DigitalInputDevice(
+                pino_do_ir, pull_up=None, active_state=ativo_high
+            )
+            self.ativo = True
+            log("Hardware GPIO inicializado (LED, VCC IR e DO IR).")
+        except Exception as e:
+            log(f"Hardware GPIO indisponível ({e}); operando em fallback.")
+
+    def ligar(self) -> None:
+        if self.ativo:
+            self.led.on()
+            self.vcc_ir.on()
+            time.sleep(0.05)
+
+    def desligar(self) -> None:
+        if self.ativo:
+            self.led.off()
+            self.vcc_ir.off()
+
+    @property
+    def carta_no_sensor(self) -> bool:
+        if not self.ativo:
+            return True
+        return self.sensor_ir.is_active
+
+    def fechar(self) -> None:
+        if self.ativo:
+            self.desligar()
+            self.led.close()
+            self.vcc_ir.close()
+            self.sensor_ir.close()
+
+
+def orientar(bruto):
+    girado = cv2.rotate(bruto, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    return cv2.flip(girado, 1)
+
+
+def calcular_hog(img):
+    hog = cv2.HOGDescriptor((32, 32), (16, 16), (8, 8), (8, 8), 9)
+    return hog.compute(img).reshape(1, -1)
+
+
+def extrair_simbolo(recorte):
+    cinza = cv2.cvtColor(recorte, cv2.COLOR_BGR2GRAY)
+    if cv2.mean(cinza)[0] < LIMIAR_PRESENCA:
+        return None
+
+    cinza_blur = cv2.GaussianBlur(cinza, (3, 3), 0)
+    _, binaria = cv2.threshold(
+        cinza_blur, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU
+    )
+
+    contornos, _ = cv2.findContours(binaria, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    area_max = 0.5 * recorte.size / 3
+    x_min, y_min, x_max, y_max = 9999, 9999, -1, -1
+    achou = False
+
+    for c in contornos:
+        a = cv2.contourArea(c)
+        if a < AREA_MIN or a > area_max:
+            continue
+        x, y, w, h = cv2.boundingRect(c)
+        x_min = min(x_min, x)
+        y_min = min(y_min, y)
+        x_max = max(x_max, x + w)
+        y_max = max(y_max, y + h)
+        achou = True
+
+    if not achou:
+        return None
+
+    tinta = binaria[y_min:y_max, x_min:x_max]
+    lado_sq = max(tinta.shape[1], tinta.shape[0])
+    margem = max(2, lado_sq // 8)
+
+    quadrado = np.zeros((lado_sq + 2 * margem, lado_sq + 2 * margem), dtype=np.uint8)
+    ox = margem + (lado_sq - tinta.shape[1]) // 2
+    oy = margem + (lado_sq - tinta.shape[0]) // 2
+    quadrado[oy : oy + tinta.shape[0], ox : ox + tinta.shape[1]] = tinta
+
+    img_redim = cv2.resize(quadrado, (LADO, LADO), interpolation=cv2.INTER_AREA)
+
+    mascara = binaria[y_min:y_max, x_min:x_max]
+    recorte_roi = recorte[y_min:y_max, x_min:x_max]
+    media_bgr = cv2.mean(recorte_roi, mask=mascara)
+    vermelho = (media_bgr[2] - 0.5 * (media_bgr[0] + media_bgr[1])) > LIMIAR_VERMELHO
+
+    return img_redim, vermelho
+
+
+def prever(modelo, nomes, img) -> str:
+    caracteristicas = np.float32(calcular_hog(img))
+    _, r = modelo.predict(caracteristicas)
+    i = int(r[0][0])
+    return nomes[i] if 0 <= i < len(nomes) else "?"
+
+
+def ler_comandos() -> None:
+    for linha in sys.stdin:
+        cmd = linha.strip()
+        if not cmd:
+            continue
+        with lock_estado:
+            if cmd == "LIGAR":
+                estado["quer_camera"] = True
+            elif cmd == "DESLIGAR":
+                estado["quer_camera"] = False
+            elif cmd == "RESET_LEITURA":
+                estado["resetar_leitura"] = True
+            elif cmd.startswith("USADAS;"):
+                corpo = cmd.split(";", 1)[1].strip()
+                estado["cartas_usadas"] = {
+                    c.strip() for c in corpo.split(",") if c.strip()
+                }
+            elif cmd == "SAIR":
+                estado["rodando"] = False
+                break
+            else:
+                log(f"Comando desconhecido: {cmd}")
+    with lock_estado:
+        estado["rodando"] = False
+
+
+def main():
+    pasta_modelos = Path(__file__).resolve().parent / "modelos"
+    try:
+        svm_valores = cv2.ml.SVM_load(str(pasta_modelos / "modelo_valores.xml"))
+        svm_vermelhos = cv2.ml.SVM_load(
+            str(pasta_modelos / "modelo_naipes_vermelhos.xml")
+        )
+        svm_pretos = cv2.ml.SVM_load(str(pasta_modelos / "modelo_naipes_pretos.xml"))
+        if svm_valores.empty() or svm_vermelhos.empty() or svm_pretos.empty():
+            raise FileNotFoundError("Um ou mais arquivos XML estão vazios ou ausentes.")
+    except Exception as e:
+        evento(f"ERRO;Falha ao carregar modelos XML em {pasta_modelos}: {e}")
+        return 1
+
+    hw = HardwareScanner(PINO_LED, PINO_VCC_IR, PINO_DO_IR, IR_ATIVO_EM_HIGH)
+
+    threading.Thread(target=ler_comandos, daemon=True).start()
+    evento("PRONTO")
+
+    cap = None
+    estado_ir_anterior = None
+    momento_deteccao_ir = 0.0
+    candidata_atual = None
+    votos = 0
+    votos_duplicada = 0
+    carta_confirmada = False
+    duplicada_notificada = None
+
+    rx, ry, rw, rh = ROI_NUMERO
+    nx, ny, nw, nh = ROI_NAIPE
+
+    try:
+        while True:
+            with lock_estado:
+                rodando = estado["rodando"]
+                quer_camera = estado["quer_camera"]
+                cartas_usadas = set(estado["cartas_usadas"])
+                resetar = estado["resetar_leitura"]
+                if resetar:
+                    estado["resetar_leitura"] = False
+
+            if not rodando:
+                break
+
+            if resetar:
+                candidata_atual = None
+                votos = 0
+                votos_duplicada = 0
+                carta_confirmada = False
+                duplicada_notificada = None
+
+            if quer_camera and cap is None:
+                try:
+                    from picamera2 import Picamera2
+
+                    cap = Picamera2()
+                    cap.configure(
+                        cap.create_video_configuration(
+                            main={"size": (640, 480), "format": "RGB888"}
+                        )
+                    )
+                    cap.start()
+                    time.sleep(1.0)
+                    hw.ligar()
+
+                    estado_ir_anterior = None
+                    candidata_atual = None
+                    votos = 0
+                    votos_duplicada = 0
+                    carta_confirmada = False
+                    duplicada_notificada = None
+                    evento("CAMERA_LIGADA")
+                except Exception as e:
+                    log(f"Falha ao ligar câmera: {e}")
+                    evento(f"ERRO;Falha ao ligar câmera: {e}")
+                    with lock_estado:
+                        estado["quer_camera"] = False
+                    time.sleep(0.5)
+                    continue
+
+            elif not quer_camera:
+                if estado_ir_anterior is not None:
+                    hw.desligar()
+                    estado_ir_anterior = None
+                    candidata_atual = None
+                    votos = 0
+                    votos_duplicada = 0
+                    carta_confirmada = False
+                    duplicada_notificada = None
+                    evento("CAMERA_DESLIGADA")
+                time.sleep(0.12)
+                continue
+
+            if cap is None:
+                time.sleep(0.1)
+                continue
+
+            carta_presente = hw.carta_no_sensor
+
+            if carta_presente != estado_ir_anterior:
+                if carta_presente:
+                    momento_deteccao_ir = time.monotonic()
+                    log("[IR] Carta entrou no scanner. Aguardando estabilizar...")
+                else:
+                    if estado_ir_anterior is not None:
+                        log("[IR] Carta removida do scanner.")
+                        evento("CARTA_REMOVIDA")
+                candidata_atual = None
+                votos = 0
+                votos_duplicada = 0
+                carta_confirmada = False
+                duplicada_notificada = None
+                estado_ir_anterior = carta_presente
+
+            if not carta_presente or carta_confirmada:
+                time.sleep(0.03)
+                continue
+
+            if (time.monotonic() - momento_deteccao_ir) < TEMPO_ESTABILIZACAO:
+                time.sleep(0.02)
+                continue
+
+            try:
+                bruto = cap.capture_array("main")
+            except Exception as e:
+                log(f"ERRO ao capturar frame: {e}")
+                time.sleep(0.05)
+                continue
+
+            frame = orientar(bruto)
+            rec_num = frame[ry : ry + rh, rx : rx + rw]
+            rec_nai = frame[ny : ny + nh, nx : nx + nw]
+
+            res_v = extrair_simbolo(rec_num)
+            res_n = extrair_simbolo(rec_nai)
+
+            valor = (
+                prever(svm_valores, NOMES_VALORES, res_v[0])
+                if res_v is not None
+                else "?"
+            )
+            naipe = "?"
+            if res_n is not None:
+                img_n, is_red = res_n
+                naipe = (
+                    prever(svm_vermelhos, NOMES_NAIPES_VERMELHOS, img_n)
+                    if is_red
+                    else prever(svm_pretos, NOMES_NAIPES_PRETOS, img_n)
+                )
+
+            if valor != "?" and naipe != "?":
+                codigo = traduzir_codigo(valor, naipe)
+                leitura = (valor, naipe)
+
+                # Bloqueio inteligente de carta já usada na rodada:
+                # descarta falso positivo momentâneo; só avisa duplicata se persistir
+                if codigo in cartas_usadas:
+                    votos = 0
+                    if leitura == candidata_atual:
+                        votos_duplicada += 1
+                    else:
+                        candidata_atual = leitura
+                        votos_duplicada = 1
+
+                    if (
+                        votos_duplicada >= VOTOS_NECESSARIOS
+                        and duplicada_notificada != codigo
+                    ):
+                        duplicada_notificada = codigo
+                        log(f"[SCANNER] Carta duplicada bloqueada: {valor} de {naipe}")
+                        evento(f"DUPLICADA;{valor};{naipe}")
+                else:
+                    votos_duplicada = 0
+                    duplicada_notificada = None
+                    if leitura == candidata_atual:
+                        votos += 1
+                    else:
+                        candidata_atual = leitura
+                        votos = 1
+
+                    if votos >= VOTOS_NECESSARIOS:
+                        carta_confirmada = True
+                        log(f"[SCANNER] Carta confirmada: {valor} de {naipe}")
+                        evento(f"CARTA;{valor};{naipe}")
+            else:
+                candidata_atual = None
+                votos = 0
+                votos_duplicada = 0
+
+            time.sleep(0.03)
+    finally:
+        if cap is not None:
+            cap.stop()
+            cap.close()
+        hw.fechar()
+
+
+if __name__ == "__main__":
+    main()
+
+=== ./servidor_pi/interface.py ===
+#!/usr/bin/env python3
+import queue
+import subprocess
+import sys
+import tkinter as tk
+
+from regras_de_negocio import fmt_valor
+from servidor_mesa import ServidorMesa, obter_ip_local
+
+LARGURA = 480
+ALTURA = 320
+ALTURA_HEADER = 36
+ALTURA_CORPO = ALTURA - ALTURA_HEADER
+
+COR_BG = "#121212"
+COR_CARD = "#1E1E1E"
+COR_CARD_ALT = "#262626"
+COR_TEXTO = "#FFFFFF"
+COR_SUB = "#B0BEC5"
+
+NAIPES_ICONE = {"s": "♠", "h": "♥", "d": "♦", "c": "♣"}
+
+
+def formatar_carta(codigo: str) -> tuple[str, str]:
+    if len(codigo) < 2:
+        return codigo, "#111111"
+    valor = "10" if codigo[:-1].upper() == "T" else codigo[:-1].upper()
+    naipe = codigo[-1].lower()
+    icone = NAIPES_ICONE.get(naipe, naipe)
+    cor = "#C62828" if naipe in ("h", "d") else "#111111"
+    return f"{valor}{icone}", cor
+
+
+class ScrollableTouchFrame(tk.Frame):
+    """Container com rolagem vertical por arrasto de dedo (touch) para LCD 480x320."""
+
+    def __init__(self, master, bg=COR_BG, **kwargs):
+        super().__init__(master, bg=bg, **kwargs)
+        self.canvas = tk.Canvas(self, bg=bg, bd=0, highlightthickness=0)
+        self.scrollbar = tk.Scrollbar(
+            self, orient="vertical", command=self.canvas.yview, width=10
+        )
+        self.inner = tk.Frame(self.canvas, bg=bg)
+        self.win_id = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.scrollbar.pack(side="right", fill="y")
+
+        self.inner.bind("<Configure>", self._on_inner_configure)
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
+
+        self._drag_y = 0
+        self.vincular_touch(self.canvas)
+        self.vincular_touch(self.inner)
+
+    def _on_inner_configure(self, _e=None):
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _on_canvas_configure(self, event):
+        self.canvas.itemconfig(self.win_id, width=event.width)
+
+    def vincular_touch(self, widget):
+        widget.bind("<ButtonPress-1>", self._inicio_arrasto, add="+")
+        widget.bind("<B1-Motion>", self._movimento_arrasto, add="+")
+
+    def vincular_filhos_recursivo(self, widget):
+        if not isinstance(widget, tk.Button):
+            self.vincular_touch(widget)
+        for filho in widget.winfo_children():
+            self.vincular_filhos_recursivo(filho)
+
+    def _inicio_arrasto(self, event):
+        self._drag_y = event.y_root
+
+    def _movimento_arrasto(self, event):
+        dy = self._drag_y - event.y_root
+        if abs(dy) >= 6:
+            unidades = int(dy / 12)
+            if unidades != 0:
+                self.canvas.yview_scroll(unidades, "units")
+                self._drag_y = event.y_root
+
+    def limpar(self):
+        for w in self.inner.winfo_children():
+            w.destroy()
+        self.canvas.yview_moveto(0)
+
+
+class InterfacePokerLCD:
+    def __init__(self, root: tk.Tk) -> None:
+        self.root = root
+        self.root.title("PokerTable Central")
+
+        # Detecta a resolução real do display (evita cortar o rodapé em telas 320x240)
+        global LARGURA, ALTURA, ALTURA_CORPO
+        larg_tela = self.root.winfo_screenwidth()
+        alt_tela = self.root.winfo_screenheight()
+        if larg_tela > 0 and alt_tela > 0:
+            LARGURA = min(480, larg_tela)
+            ALTURA = min(320, alt_tela)
+            ALTURA_CORPO = ALTURA - ALTURA_HEADER
+
+        self.root.title("PokerTable Central")
+        self.root.geometry(f"{LARGURA}x{ALTURA}+0+0")
+        self.root.configure(bg=COR_BG, cursor="none")
+        self.root.resizable(False, False)
+        self.root.bind("<Escape>", lambda _e: self._sair_app())
+
+        self.ip_local = obter_ip_local()
+        self.fila_ui: queue.SimpleQueue = queue.SimpleQueue()
+        self.tela_ativa = ""
+
+        self._criar_header_global()
+        self._criar_tela_lobby()
+        self._criar_tela_distribuir_mao()
+        self._criar_tela_distribuir_mesa()
+        self._criar_tela_jogo()
+        self._criar_tela_virar_mesa()
+        self._criar_tela_showdown()
+        self._criar_tela_placar()
+        self._criar_overlay_desligamento()
+
+        self.servidor = ServidorMesa(
+            porta=5000, on_atualizar_ui=lambda: self.fila_ui.put("ATUALIZAR")
+        )
+        self.servidor.iniciar()
+
+        self._renderizar_estado()
+        self._processar_fila_ui()
+
+        modo_mouse = "--mouse" in sys.argv
+        self.root.title("PokerTable Central")
+        if modo_mouse:
+            self.root.geometry(f"{LARGURA}x{ALTURA}+80+80")
+            self.root.configure(bg=COR_BG, cursor="arrow")
+        else:
+            self.root.geometry(f"{LARGURA}x{ALTURA}+0+0")
+            self.root.configure(bg=COR_BG, cursor="none")
+
+    # =========================================================================
+    # HEADER GLOBAL (PRESENTE EM TODAS AS TELAS COM BOTÃO DE DESLIGAR)
+    # =========================================================================
+    def _criar_header_global(self):
+        self.header = tk.Frame(self.root, bg="#1A1A1A", height=ALTURA_HEADER)
+        self.header.place(x=0, y=0, width=LARGURA, height=ALTURA_HEADER)
+
+        self.lbl_header_titulo = tk.Label(
+            self.header,
+            text=f"POKER • {self.ip_local}:5000",
+            fg="#E0E0E0",
+            bg="#1A1A1A",
+            font=("DejaVu Sans", 11, "bold"),
+            anchor="w",
+        )
+        self.lbl_header_titulo.place(x=10, y=0, width=420, height=ALTURA_HEADER)
+
+        tk.Button(
+            self.header,
+            text="⏻",
+            command=self._mostrar_confirmacao_desligar,
+            bg="#C62828",
+            fg="#FFFFFF",
+            activebackground="#8E0000",
+            activeforeground="#FFFFFF",
+            font=("DejaVu Sans", 13, "bold"),
+            bd=0,
+            highlightthickness=0,
+        ).place(x=LARGURA - 42, y=3, width=38, height=30)
+
+    # =========================================================================
+    # TELA 1: LOBBY / AGUARDANDO JOGADORES
+    # =========================================================================
+    def _criar_tela_lobby(self):
+        f = tk.Frame(self.root, bg=COR_BG)
+        self.frame_lobby = f
+
+        f.grid_columnconfigure(0, weight=1)
+        f.grid_rowconfigure(0, weight=0)  # Topo (Total e Blinds)
+        f.grid_rowconfigure(1, weight=1)  # Lista de jogadores (expande/encolhe)
+        f.grid_rowconfigure(2, weight=0)  # Rodapé (Bot e Iniciar Partida - fixo)
+
+        topo = tk.Frame(f, bg="#181818", height=34)
+        topo.grid(row=0, column=0, sticky="ew", padx=6, pady=(4, 2))
+        topo.pack_propagate(False)
+
+        self.lbl_lobby_total = tk.Label(
+            topo,
+            text="Total: R$ 0",
+            fg="#69F0AE",
+            bg="#181818",
+            font=("DejaVu Sans", 11, "bold"),
+        )
+        self.lbl_lobby_total.pack(side="left", padx=8)
+
+        ctrl_blinds = tk.Frame(topo, bg="#181818")
+        ctrl_blinds.pack(side="right", padx=6)
+
+        tk.Button(
+            ctrl_blinds,
+            text="-",
+            command=lambda: self.servidor.ui_ajustar_blinds(-1),
+            bg="#37474F",
+            fg="#FFFFFF",
+            activebackground="#546E7A",
+            font=("DejaVu Sans", 12, "bold"),
+            width=2,
+            bd=0,
+            highlightthickness=0,
+        ).pack(side="left", padx=2, pady=2)
+
+        self.lbl_blinds = tk.Label(
+            ctrl_blinds,
+            text="SB/BB: 10/20",
+            fg="#FFD54F",
+            bg="#181818",
+            font=("DejaVu Sans", 10, "bold"),
+            width=13,
+        )
+        self.lbl_blinds.pack(side="left", padx=2)
+
+        tk.Button(
+            ctrl_blinds,
+            text="+",
+            command=lambda: self.servidor.ui_ajustar_blinds(1),
+            bg="#37474F",
+            fg="#FFFFFF",
+            activebackground="#546E7A",
+            font=("DejaVu Sans", 12, "bold"),
+            width=2,
+            bd=0,
+            highlightthickness=0,
+        ).pack(side="left", padx=2, pady=2)
+
+        self.scroll_lobby = ScrollableTouchFrame(f, bg=COR_BG)
+        self.scroll_lobby.grid(row=1, column=0, sticky="nsew", padx=6, pady=2)
+
+        rodape = tk.Frame(f, bg=COR_BG, height=44)
+        rodape.grid(row=2, column=0, sticky="ew", padx=6, pady=(2, 4))
+        rodape.pack_propagate(False)
+
+        self.btn_bot = tk.Button(
+            rodape,
+            text="Modo Teste: OFF",
+            command=lambda: self.servidor.ui_alternar_bot(),
+            bg="#455A64",
+            fg="#FFFFFF",
+            activebackground="#607D8B",
+            font=("DejaVu Sans", 10, "bold"),
+            bd=0,
+            highlightthickness=0,
+        )
+        self.btn_bot.pack(side="left", fill="both", expand=True, padx=(0, 4))
+
+        self.btn_iniciar = tk.Button(
+            rodape,
+            text="INICIAR PARTIDA",
+            command=lambda: self.servidor.ui_iniciar_rodada(),
+            bg="#2E7D32",
+            fg="#FFFFFF",
+            activebackground="#1B5E20",
+            disabledforeground="#9E9E9E",
+            font=("DejaVu Sans", 11, "bold"),
+            bd=0,
+            highlightthickness=0,
+        )
+        self.btn_iniciar.pack(side="right", fill="both", expand=True, padx=(4, 0))
+
+    # =========================================================================
+    # TELA 2: DISTRIBUIÇÃO DAS 2 CARTAS POR JOGADOR (OCULTAS NO LCD)
+    # =========================================================================
+    def _criar_tela_distribuir_mao(self):
+        f = tk.Frame(self.root, bg=COR_BG)
+        self.frame_distribuir_mao = f
+
+        self.lbl_dist_progresso = tk.Label(
+            f,
+            text="DISTRIBUINDO CARTAS PRIVADAS",
+            fg="#90CAF9",
+            bg=COR_BG,
+            font=("DejaVu Sans", 11, "bold"),
+        )
+        self.lbl_dist_progresso.pack(pady=(10, 4))
+
+        tk.Label(
+            f,
+            text="Escaneie e entregue 2 cartas para:",
+            fg=COR_SUB,
+            bg=COR_BG,
+            font=("DejaVu Sans", 11),
+        ).pack()
+
+        self.lbl_dist_nome = tk.Label(
+            f,
+            text="-",
+            fg="#FFFFFF",
+            bg=COR_BG,
+            font=("DejaVu Sans", 22, "bold"),
+        )
+        self.lbl_dist_nome.pack(pady=(4, 6))
+
+        self.lbl_dist_contador = tk.Label(
+            f,
+            text="0 / 2 cartas lidas",
+            fg="#FFD54F",
+            bg="#1E1E1E",
+            font=("DejaVu Sans", 16, "bold"),
+            padx=20,
+            pady=8,
+        )
+        self.lbl_dist_contador.pack(pady=4)
+
+        self.lbl_dist_aviso = tk.Label(
+            f,
+            text="",
+            fg="#FF8A65",
+            bg=COR_BG,
+            font=("DejaVu Sans", 10, "bold"),
+            wraplength=450,
+        )
+        self.lbl_dist_aviso.pack(pady=(6, 4))
+
+        rodape = tk.Frame(f, bg=COR_BG, height=52)
+        rodape.pack(side="bottom", fill="x", padx=10, pady=8)
+        rodape.pack_propagate(False)
+
+        tk.Button(
+            rodape,
+            text="Limpar / Re-escanear",
+            command=lambda: self.servidor.ui_limpar_leitura(),
+            bg="#E65100",
+            fg="#FFFFFF",
+            activebackground="#BF360C",
+            font=("DejaVu Sans", 11, "bold"),
+            bd=0,
+            highlightthickness=0,
+        ).pack(side="left", fill="both", expand=True, padx=(0, 6))
+
+        self.btn_confirmar_mao = tk.Button(
+            rodape,
+            text="Confirmar Entrega",
+            command=lambda: self.servidor.ui_confirmar_distribuicao(),
+            bg="#2E7D32",
+            fg="#FFFFFF",
+            activebackground="#1B5E20",
+            disabledforeground="#888888",
+            font=("DejaVu Sans", 12, "bold"),
+            bd=0,
+            highlightthickness=0,
+        )
+        self.btn_confirmar_mao.pack(side="right", fill="both", expand=True, padx=(6, 0))
+
+    # =========================================================================
+    # TELA 3: DISTRIBUIÇÃO DAS 5 CARTAS DA MESA (VIRADAS PARA BAIXO)
+    # =========================================================================
+    def _criar_tela_distribuir_mesa(self):
+        f = tk.Frame(self.root, bg=COR_BG)
+        self.frame_distribuir_mesa = f
+
+        tk.Label(
+            f,
+            text="CARTAS DA MESA (VIRADAS PARA BAIXO)",
+            fg="#80CBC4",
+            bg=COR_BG,
+            font=("DejaVu Sans", 12, "bold"),
+        ).pack(pady=(10, 4))
+
+        tk.Label(
+            f,
+            text="Escaneie as 5 cartas comunitárias e disponha viradas para baixo:",
+            fg=COR_SUB,
+            bg=COR_BG,
+            font=("DejaVu Sans", 10),
+        ).pack()
+
+        self.row_slots_ocultos = tk.Frame(f, bg=COR_BG)
+        self.row_slots_ocultos.pack(pady=10)
+        self.slots_ocultos_lbls = []
+        for _ in range(5):
+            lbl = tk.Label(
+                self.row_slots_ocultos,
+                text="?",
+                fg="#78909C",
+                bg="#263238",
+                font=("DejaVu Sans", 16, "bold"),
+                width=4,
+                height=2,
+            )
+            lbl.pack(side="left", padx=5)
+            self.slots_ocultos_lbls.append(lbl)
+
+        self.lbl_mesa_contador = tk.Label(
+            f,
+            text="0 / 5 cartas lidas",
+            fg="#FFD54F",
+            bg=COR_BG,
+            font=("DejaVu Sans", 14, "bold"),
+        )
+        self.lbl_mesa_contador.pack(pady=2)
+
+        self.lbl_mesa_aviso = tk.Label(
+            f,
+            text="",
+            fg="#FF8A65",
+            bg=COR_BG,
+            font=("DejaVu Sans", 10, "bold"),
+            wraplength=450,
+        )
+        self.lbl_mesa_aviso.pack(pady=4)
+
+        rodape = tk.Frame(f, bg=COR_BG, height=52)
+        rodape.pack(side="bottom", fill="x", padx=10, pady=8)
+        rodape.pack_propagate(False)
+
+        tk.Button(
+            rodape,
+            text="Limpar / Re-escanear",
+            command=lambda: self.servidor.ui_limpar_leitura(),
+            bg="#E65100",
+            fg="#FFFFFF",
+            activebackground="#BF360C",
+            font=("DejaVu Sans", 11, "bold"),
+            bd=0,
+            highlightthickness=0,
+        ).pack(side="left", fill="both", expand=True, padx=(0, 6))
+
+        self.btn_confirmar_mesa = tk.Button(
+            rodape,
+            text="Confirmar 5 Cartas",
+            command=lambda: self.servidor.ui_confirmar_distribuicao(),
+            bg="#2E7D32",
+            fg="#FFFFFF",
+            activebackground="#1B5E20",
+            disabledforeground="#888888",
+            font=("DejaVu Sans", 12, "bold"),
+            bd=0,
+            highlightthickness=0,
+        )
+        self.btn_confirmar_mesa.pack(
+            side="right", fill="both", expand=True, padx=(6, 0)
+        )
+
+    # =========================================================================
+    # TELA 4: APOSTAS EM ANDAMENTO (PRÉ-FLOP, FLOP, TURN, RIVER)
+    # =========================================================================
+    def _criar_tela_jogo(self):
+        f = tk.Frame(self.root, bg=COR_BG)
+        self.frame_jogo = f
+
+        painel_topo = tk.Frame(f, bg=COR_CARD, height=54)
+        painel_topo.pack(fill="x", padx=6, pady=(4, 3))
+        painel_topo.pack_propagate(False)
+
+        esq = tk.Frame(painel_topo, bg=COR_CARD)
+        esq.pack(side="left", fill="both", expand=True, padx=8, pady=4)
+
+        tk.Label(
+            esq,
+            text="VEZ DE:",
+            fg=COR_SUB,
+            bg=COR_CARD,
+            font=("DejaVu Sans", 8, "bold"),
+        ).pack(anchor="w")
+        self.lbl_jogo_vez = tk.Label(
+            esq, text="-", fg="#69F0AE", bg=COR_CARD, font=("DejaVu Sans", 15, "bold")
+        )
+        self.lbl_jogo_vez.pack(anchor="w")
+
+        dir_box = tk.Frame(painel_topo, bg=COR_CARD)
+        dir_box.pack(side="right", fill="y", padx=8, pady=4)
+
+        self.lbl_jogo_pote = tk.Label(
+            dir_box,
+            text="POTE: R$ 0",
+            fg="#FFD54F",
+            bg=COR_CARD,
+            font=("DejaVu Sans", 13, "bold"),
+            anchor="e",
+        )
+        self.lbl_jogo_pote.pack(anchor="e")
+
+        self.lbl_jogo_aposta = tk.Label(
+            dir_box,
+            text="Aposta: R$ 0",
+            fg=COR_SUB,
+            bg=COR_CARD,
+            font=("DejaVu Sans", 9),
+            anchor="e",
+        )
+        self.lbl_jogo_aposta.pack(anchor="e")
+
+        # Faixa das 5 cartas da mesa (reveladas ou ocultas)
+        self.row_cartas_jogo = tk.Frame(f, bg=COR_BG, height=40)
+        self.row_cartas_jogo.pack(fill="x", padx=6, pady=2)
+        self.slots_cartas_jogo = []
+        holder = tk.Frame(self.row_cartas_jogo, bg=COR_BG)
+        holder.pack()
+        for _ in range(5):
+            lbl = tk.Label(
+                holder,
+                text="?",
+                fg="#78909C",
+                bg="#263238",
+                font=("DejaVu Sans", 13, "bold"),
+                width=5,
+                height=1,
+                pady=4,
+            )
+            lbl.pack(side="left", padx=4)
+            self.slots_cartas_jogo.append(lbl)
+
+        self.lbl_jogo_msg = tk.Label(
+            f,
+            text="",
+            fg="#81D4FA",
+            bg="#181818",
+            font=("DejaVu Sans", 9),
+            anchor="w",
+            padx=8,
+            pady=3,
+        )
+        self.lbl_jogo_msg.pack(fill="x", padx=6, pady=(2, 3))
+
+        self.scroll_jogo = ScrollableTouchFrame(f, bg=COR_BG)
+        self.scroll_jogo.pack(fill="both", expand=True, padx=6, pady=(0, 4))
+
+    # =========================================================================
+    # TELA 5: AVISO PARA VIRAR CARTAS DA MESA
+    # =========================================================================
+    def _criar_tela_virar_mesa(self):
+        f = tk.Frame(self.root, bg=COR_BG)
+        self.frame_virar_mesa = f
+
+        self.lbl_virar_titulo = tk.Label(
+            f,
+            text="VIRE AS CARTAS",
+            fg="#FFD54F",
+            bg=COR_BG,
+            font=("DejaVu Sans", 20, "bold"),
+            justify="center",
+        )
+        self.lbl_virar_titulo.pack(pady=(28, 8))
+
+        self.lbl_virar_sub = tk.Label(
+            f,
+            text="Vire as cartas correspondentes na mesa física\ne confirme abaixo para revelar nos celulares.",
+            fg=COR_SUB,
+            bg=COR_BG,
+            font=("DejaVu Sans", 11),
+            justify="center",
+        )
+        self.lbl_virar_sub.pack(pady=6)
+
+        self.lbl_virar_pote = tk.Label(
+            f,
+            text="Pote atual: R$ 0",
+            fg="#69F0AE",
+            bg=COR_BG,
+            font=("DejaVu Sans", 13, "bold"),
+        )
+        self.lbl_virar_pote.pack(pady=10)
+
+        tk.Button(
+            f,
+            text="CONFIRMAR CARTAS VIRADAS",
+            command=lambda: self.servidor.ui_confirmar_virar_mesa(),
+            bg="#2E7D32",
+            fg="#FFFFFF",
+            activebackground="#1B5E20",
+            font=("DejaVu Sans", 14, "bold"),
+            bd=0,
+            highlightthickness=0,
+            height=3,
+        ).pack(side="bottom", fill="x", padx=20, pady=18)
+
+    # =========================================================================
+    # TELA 6: RESULTADO DA RODADA (SHOWDOWN)
+    # =========================================================================
+    def _criar_tela_showdown(self):
+        f = tk.Frame(self.root, bg=COR_BG)
+        self.frame_showdown = f
+
+        self.lbl_show_titulo = tk.Label(
+            f,
+            text="RESULTADO DA RODADA",
+            fg="#FFD54F",
+            bg=COR_BG,
+            font=("DejaVu Sans", 12, "bold"),
+        )
+        self.lbl_show_titulo.pack(pady=(5, 2))
+
+        self.row_cartas_show = tk.Frame(f, bg=COR_BG)
+        self.row_cartas_show.pack(pady=2)
+
+        self.scroll_showdown = ScrollableTouchFrame(f, bg=COR_BG)
+        self.scroll_showdown.pack(fill="both", expand=True, padx=6, pady=3)
+
+        rodape = tk.Frame(f, bg=COR_BG, height=48)
+        rodape.pack(fill="x", padx=8, pady=(2, 6))
+        rodape.pack_propagate(False)
+
+        tk.Button(
+            rodape,
+            text="Encerrar Jogo",
+            command=lambda: self.servidor.ui_encerrar_jogo(),
+            bg="#C62828",
+            fg="#FFFFFF",
+            activebackground="#8E0000",
+            font=("DejaVu Sans", 11, "bold"),
+            bd=0,
+            highlightthickness=0,
+        ).pack(side="left", fill="both", expand=True, padx=(0, 6))
+
+        self.btn_nova_rodada = tk.Button(
+            rodape,
+            text="Nova Rodada",
+            command=lambda: self.servidor.ui_iniciar_rodada(),
+            bg="#2E7D32",
+            fg="#FFFFFF",
+            activebackground="#1B5E20",
+            disabledforeground="#888888",
+            font=("DejaVu Sans", 12, "bold"),
+            bd=0,
+            highlightthickness=0,
+        )
+        self.btn_nova_rodada.pack(side="right", fill="both", expand=True, padx=(6, 0))
+
+    # =========================================================================
+    # TELA 7: PLACAR FINAL DA SESSÃO
+    # =========================================================================
+    def _criar_tela_placar(self):
+        f = tk.Frame(self.root, bg=COR_BG)
+        self.frame_placar = f
+
+        tk.Label(
+            f,
+            text="PLACAR FINAL DA MESA",
+            fg="#FFD54F",
+            bg=COR_BG,
+            font=("DejaVu Sans", 13, "bold"),
+        ).pack(pady=(6, 4))
+
+        self.scroll_placar = ScrollableTouchFrame(f, bg=COR_BG)
+        self.scroll_placar.pack(fill="both", expand=True, padx=6, pady=2)
+
+        tk.Button(
+            f,
+            text="Voltar ao Início (Nova Mesa)",
+            command=lambda: self.servidor.ui_voltar_inicio(),
+            bg="#1565C0",
+            fg="#FFFFFF",
+            activebackground="#0D47A1",
+            font=("DejaVu Sans", 12, "bold"),
+            bd=0,
+            highlightthickness=0,
+            height=2,
+        ).pack(fill="x", padx=12, pady=8)
+
+    # =========================================================================
+    # OVERLAY GLOBAL DE CONFIRMAÇÃO DE DESLIGAMENTO
+    # =========================================================================
+    def _criar_overlay_desligamento(self):
+        self.frame_desligar = tk.Frame(self.root, bg="#1A1A1A")
+
+        self.lbl_desligar_msg = tk.Label(
+            self.frame_desligar,
+            text="Deseja realmente desligar\no Raspberry Pi?",
+            fg="#FFFFFF",
+            bg="#1A1A1A",
+            font=("DejaVu Sans", 16, "bold"),
+            justify="center",
+        )
+        self.lbl_desligar_msg.pack(expand=True, pady=(35, 10))
+
+        self.box_btns_desligar = tk.Frame(self.frame_desligar, bg="#1A1A1A")
+        self.box_btns_desligar.pack(fill="x", padx=24, pady=(0, 35))
+
+        tk.Button(
+            self.box_btns_desligar,
+            text="Cancelar",
+            command=self._ocultar_confirmacao_desligar,
+            bg="#424242",
+            fg="#FFFFFF",
+            activebackground="#616161",
+            font=("DejaVu Sans", 14, "bold"),
+            bd=0,
+            highlightthickness=0,
+            height=3,
+        ).pack(side="left", expand=True, fill="x", padx=(0, 10))
+
+        tk.Button(
+            self.box_btns_desligar,
+            text="Confirmar",
+            command=self._executar_desligamento,
+            bg="#C62828",
+            fg="#FFFFFF",
+            activebackground="#8E0000",
+            font=("DejaVu Sans", 14, "bold"),
+            bd=0,
+            highlightthickness=0,
+            height=3,
+        ).pack(side="right", expand=True, fill="x", padx=(10, 0))
+
+    # =========================================================================
+    # CONTROLE DE TELAS E RENDERIZAÇÃO DO ESTADO
+    # =========================================================================
+    def _mostrar_tela(self, nome: str, frame: tk.Frame):
+        if self.tela_ativa == nome:
+            return
+        for f in (
+            self.frame_lobby,
+            self.frame_distribuir_mao,
+            self.frame_distribuir_mesa,
+            self.frame_jogo,
+            self.frame_virar_mesa,
+            self.frame_showdown,
+            self.frame_placar,
+        ):
+            f.place_forget()
+        frame.place(x=0, y=ALTURA_HEADER, width=LARGURA, height=ALTURA_CORPO)
+        frame.tkraise()
+        self.header.tkraise()
+        self.tela_ativa = nome
+
+    def _processar_fila_ui(self):
+        atualizar = False
+        while not self.fila_ui.empty():
+            try:
+                self.fila_ui.get_nowait()
+                atualizar = True
+            except queue.Empty:
+                break
+        if atualizar:
+            self._renderizar_estado()
+        self.root.after(60, self._processar_fila_ui)
+
+    def _renderizar_estado(self):
+        s = self.servidor.obter_snapshot()
+        fase = s["fase"]
+
+        if fase == "AGUARDANDO":
+            self.lbl_header_titulo.config(text=f"LOBBY • {self.ip_local}:5000")
+            self._mostrar_tela("LOBBY", self.frame_lobby)
+            self._atualizar_lobby(s)
+
+        elif fase == "DISTRIBUINDO_MAOS":
+            self.lbl_header_titulo.config(
+                text=f"RODADA #{s['numero_rodada']} • DISTRIBUIR MÃOS"
+            )
+            self._mostrar_tela("DIST_MAO", self.frame_distribuir_mao)
+            self._atualizar_distribuir_mao(s)
+
+        elif fase == "DISTRIBUINDO_MESA":
+            self.lbl_header_titulo.config(
+                text=f"RODADA #{s['numero_rodada']} • CARTAS DA MESA"
+            )
+            self._mostrar_tela("DIST_MESA", self.frame_distribuir_mesa)
+            self._atualizar_distribuir_mesa(s)
+
+        elif fase in ("PRE_FLOP", "FLOP", "TURN", "RIVER"):
+            nomes_fase = {
+                "PRE_FLOP": "PRÉ-FLOP",
+                "FLOP": "FLOP",
+                "TURN": "TURN",
+                "RIVER": "RIVER",
+            }
+            self.lbl_header_titulo.config(
+                text=f"RODADA #{s['numero_rodada']} • {nomes_fase[fase]} • Mesa R${fmt_valor(s['montante_total'])}"
+            )
+            self._mostrar_tela("JOGO", self.frame_jogo)
+            self._atualizar_jogo(s)
+
+        elif fase in (
+            "AGUARDANDO_VIRAR_FLOP",
+            "AGUARDANDO_VIRAR_TURN",
+            "AGUARDANDO_VIRAR_RIVER",
+        ):
+            self.lbl_header_titulo.config(
+                text=f"RODADA #{s['numero_rodada']} • AÇÃO DO DEALER"
+            )
+            self._mostrar_tela("VIRAR", self.frame_virar_mesa)
+            self._atualizar_virar_mesa(s)
+
+        elif fase == "SHOWDOWN":
+            self.lbl_header_titulo.config(
+                text=f"RODADA #{s['numero_rodada']} • FINALIZADA"
+            )
+            self._mostrar_tela("SHOWDOWN", self.frame_showdown)
+            self._atualizar_showdown(s)
+
+        elif fase == "PLACAR_FINAL":
+            self.lbl_header_titulo.config(text="SESSÃO ENCERRADA • PLACAR")
+            self._mostrar_tela("PLACAR", self.frame_placar)
+            self._atualizar_placar(s)
+
+    def _atualizar_lobby(self, s: dict):
+        self.lbl_lobby_total.config(text=f"Mesa: R$ {fmt_valor(s['montante_total'])}")
+        self.lbl_blinds.config(
+            text=f"SB/BB: {fmt_valor(s['small_blind'])}/{fmt_valor(s['big_blind'])}"
+        )
+
+        if s["bot_ativo"]:
+            self.btn_bot.config(text="Bot Teste: ON", bg="#1976D2")
+        else:
+            self.btn_bot.config(text="Bot Teste: OFF", bg="#455A64")
+
+        self.btn_iniciar.config(
+            state="normal" if s["pode_iniciar"] else "disabled",
+            bg="#2E7D32" if s["pode_iniciar"] else "#333333",
+        )
+
+        self.scroll_lobby.limpar()
+        jogadores = s["jogadores"]
+        if not jogadores:
+            lbl = tk.Label(
+                self.scroll_lobby.inner,
+                text="Aguardando jogadores conectarem\npelo aplicativo Android...",
+                fg=COR_SUB,
+                bg=COR_BG,
+                font=("DejaVu Sans", 12),
+                justify="center",
+                pady=45,
+            )
+            lbl.pack(fill="x")
+            self.scroll_lobby.vincular_filhos_recursivo(lbl)
+            return
+
+        total = len(jogadores)
+        for idx, j in enumerate(jogadores):
+            cor = COR_CARD if idx % 2 == 0 else COR_CARD_ALT
+            linha = tk.Frame(self.scroll_lobby.inner, bg=cor, height=40)
+            linha.pack(fill="x", pady=2, padx=2)
+            linha.pack_propagate(False)
+
+            tk.Label(
+                linha,
+                text=f"{j['pos']}. {j['nome']}",
+                fg="#81D4FA" if j["is_bot"] else COR_TEXTO,
+                bg=cor,
+                font=("DejaVu Sans", 11, "bold"),
+                anchor="w",
+            ).pack(side="left", padx=8, fill="x", expand=True)
+
+            tk.Label(
+                linha,
+                text=f"R$ {fmt_valor(j['saldo'])}",
+                fg="#69F0AE",
+                bg=cor,
+                font=("DejaVu Sans", 11, "bold"),
+            ).pack(side="left", padx=6)
+
+            jid = j["id"]
+            tk.Button(
+                linha,
+                text="▲",
+                command=lambda target=jid: self.servidor.ui_mover_jogador(target, -1),
+                state="normal" if idx > 0 else "disabled",
+                bg="#37474F" if idx > 0 else "#222222",
+                fg="#FFFFFF",
+                disabledforeground="#555555",
+                font=("DejaVu Sans", 10, "bold"),
+                width=3,
+                bd=0,
+                highlightthickness=0,
+            ).pack(side="left", padx=2, pady=4, fill="y")
+
+            tk.Button(
+                linha,
+                text="▼",
+                command=lambda target=jid: self.servidor.ui_mover_jogador(target, 1),
+                state="normal" if idx < total - 1 else "disabled",
+                bg="#37474F" if idx < total - 1 else "#222222",
+                fg="#FFFFFF",
+                disabledforeground="#555555",
+                font=("DejaVu Sans", 10, "bold"),
+                width=3,
+                bd=0,
+                highlightthickness=0,
+            ).pack(side="left", padx=(2, 6), pady=4, fill="y")
+
+            self.scroll_lobby.vincular_filhos_recursivo(linha)
+
+    def _atualizar_distribuir_mao(self, s: dict):
+        qtd = s["buffer_qtd"]
+        self.lbl_dist_progresso.config(
+            text=f"CARTAS PRIVADAS • Jogador {s['alvo_idx']} de {s['alvo_total']}"
+        )
+        self.lbl_dist_nome.config(text=s["alvo_nome"])
+        self.lbl_dist_contador.config(
+            text=f"{qtd} / 2 cartas lidas",
+            fg="#69F0AE" if qtd == 2 else "#FFD54F",
+        )
+        self.lbl_dist_aviso.config(text=s["aviso_scanner"])
+        pronto = qtd == 2
+        self.btn_confirmar_mao.config(
+            state="normal" if pronto else "disabled",
+            bg="#2E7D32" if pronto else "#333333",
+        )
+
+    def _atualizar_distribuir_mesa(self, s: dict):
+        qtd = s["buffer_qtd"]
+        for i, lbl in enumerate(self.slots_ocultos_lbls):
+            if i < qtd:
+                lbl.config(text="✓", fg="#FFFFFF", bg="#2E7D32")
+            else:
+                lbl.config(text="?", fg="#78909C", bg="#263238")
+
+        self.lbl_mesa_contador.config(
+            text=f"{qtd} / 5 cartas lidas",
+            fg="#69F0AE" if qtd == 5 else "#FFD54F",
+        )
+        self.lbl_mesa_aviso.config(text=s["aviso_scanner"])
+        pronto = qtd == 5
+        self.btn_confirmar_mesa.config(
+            state="normal" if pronto else "disabled",
+            bg="#2E7D32" if pronto else "#333333",
+        )
+
+    def _atualizar_jogo(self, s: dict):
+        self.lbl_jogo_vez.config(text=s["jogador_vez_nome"])
+        extra_side = f" (+{s['qtd_side_pots']} Side)" if s["qtd_side_pots"] > 0 else ""
+        self.lbl_jogo_pote.config(text=f"POTE: R$ {fmt_valor(s['pote'])}{extra_side}")
+        self.lbl_jogo_aposta.config(
+            text=f"Aposta atual: R$ {fmt_valor(s['aposta_atual'])}"
+        )
+        self.lbl_jogo_msg.config(text=s["ultima_acao_msg"])
+
+        reveladas = s["cartas_mesa_reveladas"]
+        for i, lbl in enumerate(self.slots_cartas_jogo):
+            if i < len(reveladas):
+                txt, cor = formatar_carta(reveladas[i])
+                lbl.config(text=txt, fg=cor, bg="#FFFFFF")
+            else:
+                lbl.config(text="?", fg="#78909C", bg="#263238")
+
+        self.scroll_jogo.limpar()
+        for idx, j in enumerate(s["jogadores"]):
+            cor = (
+                "#1B3B2B"
+                if j["eh_vez"]
+                else (COR_CARD if idx % 2 == 0 else COR_CARD_ALT)
+            )
+            linha = tk.Frame(self.scroll_jogo.inner, bg=cor, height=32)
+            linha.pack(fill="x", pady=1, padx=2)
+            linha.pack_propagate(False)
+
+            tag = f"[{j['tags']}] " if j["tags"] else ""
+            seta = "▶ " if j["eh_vez"] else ""
+            tk.Label(
+                linha,
+                text=f"{seta}{tag}{j['nome']}",
+                fg="#69F0AE" if j["eh_vez"] else COR_TEXTO,
+                bg=cor,
+                font=("DejaVu Sans", 10, "bold"),
+                anchor="w",
+            ).pack(side="left", padx=6, fill="x", expand=True)
+
+            tk.Label(
+                linha,
+                text=f"R${fmt_valor(j['saldo'])} (Ap:{fmt_valor(j['aposta_rodada'])})",
+                fg="#FFD54F",
+                bg=cor,
+                font=("DejaVu Sans", 9),
+            ).pack(side="left", padx=4)
+
+            cor_st = {
+                "ATIVO": "#81C784",
+                "ALL-IN": "#FFAB40",
+                "FOLD": "#EF5350",
+                "ESPERA": "#90CAF9",
+            }.get(j["status"], COR_SUB)
+            tk.Label(
+                linha,
+                text=j["status"],
+                fg=cor_st,
+                bg=cor,
+                font=("DejaVu Sans", 9, "bold"),
+                width=8,
+                anchor="e",
+            ).pack(side="right", padx=6)
+
+            self.scroll_jogo.vincular_filhos_recursivo(linha)
+
+    def _atualizar_virar_mesa(self, s: dict):
+        titulos = {
+            "AGUARDANDO_VIRAR_FLOP": "VIRE AS 3 CARTAS\nDO FLOP",
+            "AGUARDANDO_VIRAR_TURN": "VIRE A 4ª CARTA\n(TURN)",
+            "AGUARDANDO_VIRAR_RIVER": "VIRE A 5ª CARTA\n(RIVER)",
+        }
+        self.lbl_virar_titulo.config(text=titulos.get(s["fase"], "VIRE AS CARTAS"))
+        self.lbl_virar_pote.config(text=f"Pote atual: R$ {fmt_valor(s['pote'])}")
+
+    def _atualizar_showdown(self, s: dict):
+        for w in self.row_cartas_show.winfo_children():
+            w.destroy()
+        for c in s["cartas_mesa_reveladas"]:
+            txt, cor = formatar_carta(c)
+            tk.Label(
+                self.row_cartas_show,
+                text=txt,
+                fg=cor,
+                bg="#FFFFFF",
+                font=("DejaVu Sans", 11, "bold"),
+                padx=6,
+                pady=2,
+            ).pack(side="left", padx=3)
+
+        self.scroll_showdown.limpar()
+        for item in s["resultado_rodada"]:
+            box = tk.Frame(self.scroll_showdown.inner, bg=COR_CARD, pady=6, padx=8)
+            box.pack(fill="x", pady=3, padx=2)
+
+            vencedores = ", ".join(item["vencedores"])
+            tk.Label(
+                box,
+                text=f"{item['pote_nome']} — {vencedores}",
+                fg="#69F0AE",
+                bg=COR_CARD,
+                font=("DejaVu Sans", 11, "bold"),
+                anchor="w",
+            ).pack(fill="x")
+
+            tk.Label(
+                box,
+                text=f"Recebeu R$ {fmt_valor(item['premio_cada'])} cada • {item['combinacao']}",
+                fg=COR_TEXTO,
+                bg=COR_CARD,
+                font=("DejaVu Sans", 10),
+                anchor="w",
+            ).pack(fill="x")
+            self.scroll_showdown.vincular_filhos_recursivo(box)
+
+        # Lista rápida de saldos atualizados e jogadores aguardando rebuy/espera
+        sep = tk.Label(
+            self.scroll_showdown.inner,
+            text="Saldos atuais (jogadores podem fazer Rebuy no celular):",
+            fg=COR_SUB,
+            bg=COR_BG,
+            font=("DejaVu Sans", 9),
+            anchor="w",
+            pady=4,
+        )
+        sep.pack(fill="x", padx=4)
+        self.scroll_showdown.vincular_touch(sep)
+
+        for j in s["jogadores"]:
+            linha = tk.Frame(self.scroll_showdown.inner, bg="#1A1A1A", height=26)
+            linha.pack(fill="x", pady=1, padx=2)
+            linha.pack_propagate(False)
+            extra = " [ESPERA]" if j["status"] == "ESPERA" else ""
+            tk.Label(
+                linha,
+                text=f"{j['nome']}{extra}",
+                fg=COR_TEXTO,
+                bg="#1A1A1A",
+                font=("DejaVu Sans", 9, "bold"),
+                anchor="w",
+            ).pack(side="left", padx=8)
+            tk.Label(
+                linha,
+                text=f"R$ {fmt_valor(j['saldo'])}",
+                fg="#EF5350" if j["saldo"] <= 0 else "#FFD54F",
+                bg="#1A1A1A",
+                font=("DejaVu Sans", 9, "bold"),
+            ).pack(side="right", padx=8)
+            self.scroll_showdown.vincular_filhos_recursivo(linha)
+
+        self.btn_nova_rodada.config(
+            state="normal" if s["pode_iniciar"] else "disabled",
+            bg="#2E7D32" if s["pode_iniciar"] else "#333333",
+        )
+
+    def _atualizar_placar(self, s: dict):
+        self.scroll_placar.limpar()
+        for idx, item in enumerate(s["placar_final"]):
+            cor = COR_CARD if idx % 2 == 0 else COR_CARD_ALT
+            linha = tk.Frame(self.scroll_placar.inner, bg=cor, height=42)
+            linha.pack(fill="x", pady=2, padx=2)
+            linha.pack_propagate(False)
+
+            lucro = item["lucro"]
+            if lucro > 0:
+                txt_lucro = f"+R$ {fmt_valor(lucro)}"
+                cor_lucro = "#69F0AE"
+            elif lucro < 0:
+                txt_lucro = f"-R$ {fmt_valor(abs(lucro))}"
+                cor_lucro = "#EF5350"
+            else:
+                txt_lucro = "R$ 0"
+                cor_lucro = COR_SUB
+
+            tk.Label(
+                linha,
+                text=f"{idx + 1}º  {item['nome']}",
+                fg=COR_TEXTO,
+                bg=cor,
+                font=("DejaVu Sans", 11, "bold"),
+                anchor="w",
+            ).pack(side="left", padx=8, fill="x", expand=True)
+
+            tk.Label(
+                linha,
+                text=f"Saldo: R$ {fmt_valor(item['saldo_final'])}",
+                fg="#FFD54F",
+                bg=cor,
+                font=("DejaVu Sans", 10),
+            ).pack(side="left", padx=6)
+
+            tk.Label(
+                linha,
+                text=txt_lucro,
+                fg=cor_lucro,
+                bg=cor,
+                font=("DejaVu Sans", 11, "bold"),
+                width=10,
+                anchor="e",
+            ).pack(side="right", padx=8)
+
+            self.scroll_placar.vincular_filhos_recursivo(linha)
+
+    # =========================================================================
+    # DESLIGAMENTO SEGURO DO RASPBERRY PI
+    # =========================================================================
+    def _mostrar_confirmacao_desligar(self):
+        self.frame_desligar.place(x=0, y=0, width=LARGURA, height=ALTURA)
+        self.frame_desligar.tkraise()
+
+    def _ocultar_confirmacao_desligar(self):
+        self.frame_desligar.place_forget()
+
+    def _executar_desligamento(self):
+        self.box_btns_desligar.pack_forget()
+        self.lbl_desligar_msg.config(
+            text="Encerrando scanner, servidor\ne desligando o Raspberry Pi...\nAguarde o LED verde apagar.",
+            fg="#FFB74D",
+            font=("DejaVu Sans", 13, "bold"),
+        )
+        self.root.update()
+        self.servidor.encerrar()
+        self.root.after(
+            300,
+            lambda: subprocess.run(
+                ["sudo", "/usr/sbin/shutdown", "-h", "now"], check=False
+            ),
+        )
+
+    def _sair_app(self):
+        self.servidor.encerrar()
+        self.root.destroy()
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    InterfacePokerLCD(root)
+    root.mainloop()
+
+=== ./servidor_pi/interface_lcd.py ===
+#!/usr/bin/env python3
+import queue
+import subprocess
+import tkinter as tk
+
+from regras_de_negocio import fmt_valor
+from servidor_mesa import ServidorMesa, obter_ip_local
+
+LARGURA = 480
+ALTURA = 320
+ALTURA_HEADER = 36
+ALTURA_CORPO = ALTURA - ALTURA_HEADER
+
+COR_BG = "#121212"
+COR_CARD = "#1E1E1E"
+COR_CARD_ALT = "#262626"
+COR_TEXTO = "#FFFFFF"
+COR_SUB = "#B0BEC5"
+
+NAIPES_ICONE = {"s": "♠", "h": "♥", "d": "♦", "c": "♣"}
+
+
+def formatar_carta(codigo: str) -> tuple[str, str]:
+    if len(codigo) < 2:
+        return codigo, "#111111"
+    valor = "10" if codigo[:-1].upper() == "T" else codigo[:-1].upper()
+    naipe = codigo[-1].lower()
+    icone = NAIPES_ICONE.get(naipe, naipe)
+    cor = "#C62828" if naipe in ("h", "d") else "#111111"
+    return f"{valor}{icone}", cor
+
+
+class ScrollableTouchFrame(tk.Frame):
+    """Container com rolagem vertical por arrasto de dedo (touch) para LCD 480x320."""
+
+    def __init__(self, master, bg=COR_BG, **kwargs):
+        super().__init__(master, bg=bg, **kwargs)
+        self.canvas = tk.Canvas(self, bg=bg, bd=0, highlightthickness=0)
+        self.scrollbar = tk.Scrollbar(
+            self, orient="vertical", command=self.canvas.yview, width=10
+        )
+        self.inner = tk.Frame(self.canvas, bg=bg)
+        self.win_id = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.scrollbar.pack(side="right", fill="y")
+
+        self.inner.bind("<Configure>", self._on_inner_configure)
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
+
+        self._drag_y = 0
+        self.vincular_touch(self.canvas)
+        self.vincular_touch(self.inner)
+
+    def _on_inner_configure(self, _e=None):
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _on_canvas_configure(self, event):
+        self.canvas.itemconfig(self.win_id, width=event.width)
+
+    def vincular_touch(self, widget):
+        widget.bind("<ButtonPress-1>", self._inicio_arrasto, add="+")
+        widget.bind("<B1-Motion>", self._movimento_arrasto, add="+")
+
+    def vincular_filhos_recursivo(self, widget):
+        if not isinstance(widget, tk.Button):
+            self.vincular_touch(widget)
+        for filho in widget.winfo_children():
+            self.vincular_filhos_recursivo(filho)
+
+    def _inicio_arrasto(self, event):
+        self._drag_y = event.y_root
+
+    def _movimento_arrasto(self, event):
+        dy = self._drag_y - event.y_root
+        if abs(dy) >= 6:
+            unidades = int(dy / 12)
+            if unidades != 0:
+                self.canvas.yview_scroll(unidades, "units")
+                self._drag_y = event.y_root
+
+    def limpar(self):
+        for w in self.inner.winfo_children():
+            w.destroy()
+        self.canvas.yview_moveto(0)
+
+
+class InterfacePokerLCD:
+    def __init__(self, root: tk.Tk) -> None:
+        self.root = root
+        self.root.title("PokerTable Central")
+
+        # Detecta a resolução real do display (evita cortar o rodapé em telas 320x240)
+        global LARGURA, ALTURA, ALTURA_CORPO
+        larg_tela = self.root.winfo_screenwidth()
+        alt_tela = self.root.winfo_screenheight()
+        if larg_tela > 0 and alt_tela > 0:
+            LARGURA = min(480, larg_tela)
+            ALTURA = min(320, alt_tela)
+            ALTURA_CORPO = ALTURA - ALTURA_HEADER
+
+        self.root.title("PokerTable Central")
+        self.root.geometry(f"{LARGURA}x{ALTURA}+0+0")
+        self.root.configure(bg=COR_BG, cursor="none")
+        self.root.resizable(False, False)
+        self.root.bind("<Escape>", lambda _e: self._sair_app())
+
+        self.ip_local = obter_ip_local()
+        self.fila_ui: queue.SimpleQueue = queue.SimpleQueue()
+        self.tela_ativa = ""
+
+        self._criar_header_global()
+        self._criar_tela_lobby()
+        self._criar_tela_distribuir_mao()
+        self._criar_tela_distribuir_mesa()
+        self._criar_tela_jogo()
+        self._criar_tela_virar_mesa()
+        self._criar_tela_showdown()
+        self._criar_tela_placar()
+        self._criar_overlay_desligamento()
+
+        self.servidor = ServidorMesa(
+            porta=5000, on_atualizar_ui=lambda: self.fila_ui.put("ATUALIZAR")
+        )
+        self.servidor.iniciar()
+
+        self._renderizar_estado()
+        self._processar_fila_ui()
+
+    # =========================================================================
+    # HEADER GLOBAL (PRESENTE EM TODAS AS TELAS COM BOTÃO DE DESLIGAR)
+    # =========================================================================
+    def _criar_header_global(self):
+        self.header = tk.Frame(self.root, bg="#1A1A1A", height=ALTURA_HEADER)
+        self.header.place(x=0, y=0, width=LARGURA, height=ALTURA_HEADER)
+
+        self.lbl_header_titulo = tk.Label(
+            self.header,
+            text=f"POKER • {self.ip_local}:5000",
+            fg="#E0E0E0",
+            bg="#1A1A1A",
+            font=("DejaVu Sans", 11, "bold"),
+            anchor="w",
+        )
+        self.lbl_header_titulo.place(x=10, y=0, width=420, height=ALTURA_HEADER)
+
+        tk.Button(
+            self.header,
+            text="⏻",
+            command=self._mostrar_confirmacao_desligar,
+            bg="#C62828",
+            fg="#FFFFFF",
+            activebackground="#8E0000",
+            activeforeground="#FFFFFF",
+            font=("DejaVu Sans", 13, "bold"),
+            bd=0,
+            highlightthickness=0,
+        ).place(x=LARGURA - 42, y=3, width=38, height=30)
+
+    # =========================================================================
+    # TELA 1: LOBBY / AGUARDANDO JOGADORES
+    # =========================================================================
+    def _criar_tela_lobby(self):
+        f = tk.Frame(self.root, bg=COR_BG)
+        self.frame_lobby = f
+
+        f.grid_columnconfigure(0, weight=1)
+        f.grid_rowconfigure(0, weight=0)  # Topo (Total e Blinds)
+        f.grid_rowconfigure(1, weight=1)  # Lista de jogadores (expande/encolhe)
+        f.grid_rowconfigure(2, weight=0)  # Rodapé (Bot e Iniciar Partida - fixo)
+
+        topo = tk.Frame(f, bg="#181818", height=34)
+        topo.grid(row=0, column=0, sticky="ew", padx=6, pady=(4, 2))
+        topo.pack_propagate(False)
+
+        self.lbl_lobby_total = tk.Label(
+            topo,
+            text="Total: R$ 0",
+            fg="#69F0AE",
+            bg="#181818",
+            font=("DejaVu Sans", 11, "bold"),
+        )
+        self.lbl_lobby_total.pack(side="left", padx=8)
+
+        ctrl_blinds = tk.Frame(topo, bg="#181818")
+        ctrl_blinds.pack(side="right", padx=6)
+
+        tk.Button(
+            ctrl_blinds,
+            text="-",
+            command=lambda: self.servidor.ui_ajustar_blinds(-1),
+            bg="#37474F",
+            fg="#FFFFFF",
+            activebackground="#546E7A",
+            font=("DejaVu Sans", 12, "bold"),
+            width=2,
+            bd=0,
+            highlightthickness=0,
+        ).pack(side="left", padx=2, pady=2)
+
+        self.lbl_blinds = tk.Label(
+            ctrl_blinds,
+            text="SB/BB: 10/20",
+            fg="#FFD54F",
+            bg="#181818",
+            font=("DejaVu Sans", 10, "bold"),
+            width=13,
+        )
+        self.lbl_blinds.pack(side="left", padx=2)
+
+        tk.Button(
+            ctrl_blinds,
+            text="+",
+            command=lambda: self.servidor.ui_ajustar_blinds(1),
+            bg="#37474F",
+            fg="#FFFFFF",
+            activebackground="#546E7A",
+            font=("DejaVu Sans", 12, "bold"),
+            width=2,
+            bd=0,
+            highlightthickness=0,
+        ).pack(side="left", padx=2, pady=2)
+
+        self.scroll_lobby = ScrollableTouchFrame(f, bg=COR_BG)
+        self.scroll_lobby.grid(row=1, column=0, sticky="nsew", padx=6, pady=2)
+
+        rodape = tk.Frame(f, bg=COR_BG, height=44)
+        rodape.grid(row=2, column=0, sticky="ew", padx=6, pady=(2, 4))
+        rodape.pack_propagate(False)
+
+        self.btn_bot = tk.Button(
+            rodape,
+            text="Modo Teste: OFF",
+            command=lambda: self.servidor.ui_alternar_bot(),
+            bg="#455A64",
+            fg="#FFFFFF",
+            activebackground="#607D8B",
+            font=("DejaVu Sans", 10, "bold"),
+            bd=0,
+            highlightthickness=0,
+        )
+        self.btn_bot.pack(side="left", fill="both", expand=True, padx=(0, 4))
+
+        self.btn_iniciar = tk.Button(
+            rodape,
+            text="INICIAR PARTIDA",
+            command=lambda: self.servidor.ui_iniciar_rodada(),
+            bg="#2E7D32",
+            fg="#FFFFFF",
+            activebackground="#1B5E20",
+            disabledforeground="#9E9E9E",
+            font=("DejaVu Sans", 11, "bold"),
+            bd=0,
+            highlightthickness=0,
+        )
+        self.btn_iniciar.pack(side="right", fill="both", expand=True, padx=(4, 0))
+
+    # =========================================================================
+    # TELA 2: DISTRIBUIÇÃO DAS 2 CARTAS POR JOGADOR (OCULTAS NO LCD)
+    # =========================================================================
+    def _criar_tela_distribuir_mao(self):
+        f = tk.Frame(self.root, bg=COR_BG)
+        self.frame_distribuir_mao = f
+
+        self.lbl_dist_progresso = tk.Label(
+            f,
+            text="DISTRIBUINDO CARTAS PRIVADAS",
+            fg="#90CAF9",
+            bg=COR_BG,
+            font=("DejaVu Sans", 11, "bold"),
+        )
+        self.lbl_dist_progresso.pack(pady=(10, 4))
+
+        tk.Label(
+            f,
+            text="Escaneie e entregue 2 cartas para:",
+            fg=COR_SUB,
+            bg=COR_BG,
+            font=("DejaVu Sans", 11),
+        ).pack()
+
+        self.lbl_dist_nome = tk.Label(
+            f,
+            text="-",
+            fg="#FFFFFF",
+            bg=COR_BG,
+            font=("DejaVu Sans", 22, "bold"),
+        )
+        self.lbl_dist_nome.pack(pady=(4, 6))
+
+        self.lbl_dist_contador = tk.Label(
+            f,
+            text="0 / 2 cartas lidas",
+            fg="#FFD54F",
+            bg="#1E1E1E",
+            font=("DejaVu Sans", 16, "bold"),
+            padx=20,
+            pady=8,
+        )
+        self.lbl_dist_contador.pack(pady=4)
+
+        self.lbl_dist_aviso = tk.Label(
+            f,
+            text="",
+            fg="#FF8A65",
+            bg=COR_BG,
+            font=("DejaVu Sans", 10, "bold"),
+            wraplength=450,
+        )
+        self.lbl_dist_aviso.pack(pady=(6, 4))
+
+        rodape = tk.Frame(f, bg=COR_BG, height=52)
+        rodape.pack(side="bottom", fill="x", padx=10, pady=8)
+        rodape.pack_propagate(False)
+
+        tk.Button(
+            rodape,
+            text="Limpar / Re-escanear",
+            command=lambda: self.servidor.ui_limpar_leitura(),
+            bg="#E65100",
+            fg="#FFFFFF",
+            activebackground="#BF360C",
+            font=("DejaVu Sans", 11, "bold"),
+            bd=0,
+            highlightthickness=0,
+        ).pack(side="left", fill="both", expand=True, padx=(0, 6))
+
+        self.btn_confirmar_mao = tk.Button(
+            rodape,
+            text="Confirmar Entrega",
+            command=lambda: self.servidor.ui_confirmar_distribuicao(),
+            bg="#2E7D32",
+            fg="#FFFFFF",
+            activebackground="#1B5E20",
+            disabledforeground="#888888",
+            font=("DejaVu Sans", 12, "bold"),
+            bd=0,
+            highlightthickness=0,
+        )
+        self.btn_confirmar_mao.pack(side="right", fill="both", expand=True, padx=(6, 0))
+
+    # =========================================================================
+    # TELA 3: DISTRIBUIÇÃO DAS 5 CARTAS DA MESA (VIRADAS PARA BAIXO)
+    # =========================================================================
+    def _criar_tela_distribuir_mesa(self):
+        f = tk.Frame(self.root, bg=COR_BG)
+        self.frame_distribuir_mesa = f
+
+        tk.Label(
+            f,
+            text="CARTAS DA MESA (VIRADAS PARA BAIXO)",
+            fg="#80CBC4",
+            bg=COR_BG,
+            font=("DejaVu Sans", 12, "bold"),
+        ).pack(pady=(10, 4))
+
+        tk.Label(
+            f,
+            text="Escaneie as 5 cartas comunitárias e disponha viradas para baixo:",
+            fg=COR_SUB,
+            bg=COR_BG,
+            font=("DejaVu Sans", 10),
+        ).pack()
+
+        self.row_slots_ocultos = tk.Frame(f, bg=COR_BG)
+        self.row_slots_ocultos.pack(pady=10)
+        self.slots_ocultos_lbls = []
+        for _ in range(5):
+            lbl = tk.Label(
+                self.row_slots_ocultos,
+                text="?",
+                fg="#78909C",
+                bg="#263238",
+                font=("DejaVu Sans", 16, "bold"),
+                width=4,
+                height=2,
+            )
+            lbl.pack(side="left", padx=5)
+            self.slots_ocultos_lbls.append(lbl)
+
+        self.lbl_mesa_contador = tk.Label(
+            f,
+            text="0 / 5 cartas lidas",
+            fg="#FFD54F",
+            bg=COR_BG,
+            font=("DejaVu Sans", 14, "bold"),
+        )
+        self.lbl_mesa_contador.pack(pady=2)
+
+        self.lbl_mesa_aviso = tk.Label(
+            f,
+            text="",
+            fg="#FF8A65",
+            bg=COR_BG,
+            font=("DejaVu Sans", 10, "bold"),
+            wraplength=450,
+        )
+        self.lbl_mesa_aviso.pack(pady=4)
+
+        rodape = tk.Frame(f, bg=COR_BG, height=52)
+        rodape.pack(side="bottom", fill="x", padx=10, pady=8)
+        rodape.pack_propagate(False)
+
+        tk.Button(
+            rodape,
+            text="Limpar / Re-escanear",
+            command=lambda: self.servidor.ui_limpar_leitura(),
+            bg="#E65100",
+            fg="#FFFFFF",
+            activebackground="#BF360C",
+            font=("DejaVu Sans", 11, "bold"),
+            bd=0,
+            highlightthickness=0,
+        ).pack(side="left", fill="both", expand=True, padx=(0, 6))
+
+        self.btn_confirmar_mesa = tk.Button(
+            rodape,
+            text="Confirmar 5 Cartas",
+            command=lambda: self.servidor.ui_confirmar_distribuicao(),
+            bg="#2E7D32",
+            fg="#FFFFFF",
+            activebackground="#1B5E20",
+            disabledforeground="#888888",
+            font=("DejaVu Sans", 12, "bold"),
+            bd=0,
+            highlightthickness=0,
+        )
+        self.btn_confirmar_mesa.pack(
+            side="right", fill="both", expand=True, padx=(6, 0)
+        )
+
+    # =========================================================================
+    # TELA 4: APOSTAS EM ANDAMENTO (PRÉ-FLOP, FLOP, TURN, RIVER)
+    # =========================================================================
+    def _criar_tela_jogo(self):
+        f = tk.Frame(self.root, bg=COR_BG)
+        self.frame_jogo = f
+
+        painel_topo = tk.Frame(f, bg=COR_CARD, height=54)
+        painel_topo.pack(fill="x", padx=6, pady=(4, 3))
+        painel_topo.pack_propagate(False)
+
+        esq = tk.Frame(painel_topo, bg=COR_CARD)
+        esq.pack(side="left", fill="both", expand=True, padx=8, pady=4)
+
+        tk.Label(
+            esq,
+            text="VEZ DE:",
+            fg=COR_SUB,
+            bg=COR_CARD,
+            font=("DejaVu Sans", 8, "bold"),
+        ).pack(anchor="w")
+        self.lbl_jogo_vez = tk.Label(
+            esq, text="-", fg="#69F0AE", bg=COR_CARD, font=("DejaVu Sans", 15, "bold")
+        )
+        self.lbl_jogo_vez.pack(anchor="w")
+
+        dir_box = tk.Frame(painel_topo, bg=COR_CARD)
+        dir_box.pack(side="right", fill="y", padx=8, pady=4)
+
+        self.lbl_jogo_pote = tk.Label(
+            dir_box,
+            text="POTE: R$ 0",
+            fg="#FFD54F",
+            bg=COR_CARD,
+            font=("DejaVu Sans", 13, "bold"),
+            anchor="e",
+        )
+        self.lbl_jogo_pote.pack(anchor="e")
+
+        self.lbl_jogo_aposta = tk.Label(
+            dir_box,
+            text="Aposta: R$ 0",
+            fg=COR_SUB,
+            bg=COR_CARD,
+            font=("DejaVu Sans", 9),
+            anchor="e",
+        )
+        self.lbl_jogo_aposta.pack(anchor="e")
+
+        # Faixa das 5 cartas da mesa (reveladas ou ocultas)
+        self.row_cartas_jogo = tk.Frame(f, bg=COR_BG, height=40)
+        self.row_cartas_jogo.pack(fill="x", padx=6, pady=2)
+        self.slots_cartas_jogo = []
+        holder = tk.Frame(self.row_cartas_jogo, bg=COR_BG)
+        holder.pack()
+        for _ in range(5):
+            lbl = tk.Label(
+                holder,
+                text="?",
+                fg="#78909C",
+                bg="#263238",
+                font=("DejaVu Sans", 13, "bold"),
+                width=5,
+                height=1,
+                pady=4,
+            )
+            lbl.pack(side="left", padx=4)
+            self.slots_cartas_jogo.append(lbl)
+
+        self.lbl_jogo_msg = tk.Label(
+            f,
+            text="",
+            fg="#81D4FA",
+            bg="#181818",
+            font=("DejaVu Sans", 9),
+            anchor="w",
+            padx=8,
+            pady=3,
+        )
+        self.lbl_jogo_msg.pack(fill="x", padx=6, pady=(2, 3))
+
+        self.scroll_jogo = ScrollableTouchFrame(f, bg=COR_BG)
+        self.scroll_jogo.pack(fill="both", expand=True, padx=6, pady=(0, 4))
+
+    # =========================================================================
+    # TELA 5: AVISO PARA VIRAR CARTAS DA MESA
+    # =========================================================================
+    def _criar_tela_virar_mesa(self):
+        f = tk.Frame(self.root, bg=COR_BG)
+        self.frame_virar_mesa = f
+
+        self.lbl_virar_titulo = tk.Label(
+            f,
+            text="VIRE AS CARTAS",
+            fg="#FFD54F",
+            bg=COR_BG,
+            font=("DejaVu Sans", 20, "bold"),
+            justify="center",
+        )
+        self.lbl_virar_titulo.pack(pady=(28, 8))
+
+        self.lbl_virar_sub = tk.Label(
+            f,
+            text="Vire as cartas correspondentes na mesa física\ne confirme abaixo para revelar nos celulares.",
+            fg=COR_SUB,
+            bg=COR_BG,
+            font=("DejaVu Sans", 11),
+            justify="center",
+        )
+        self.lbl_virar_sub.pack(pady=6)
+
+        self.lbl_virar_pote = tk.Label(
+            f,
+            text="Pote atual: R$ 0",
+            fg="#69F0AE",
+            bg=COR_BG,
+            font=("DejaVu Sans", 13, "bold"),
+        )
+        self.lbl_virar_pote.pack(pady=10)
+
+        tk.Button(
+            f,
+            text="CONFIRMAR CARTAS VIRADAS",
+            command=lambda: self.servidor.ui_confirmar_virar_mesa(),
+            bg="#2E7D32",
+            fg="#FFFFFF",
+            activebackground="#1B5E20",
+            font=("DejaVu Sans", 14, "bold"),
+            bd=0,
+            highlightthickness=0,
+            height=3,
+        ).pack(side="bottom", fill="x", padx=20, pady=18)
+
+    # =========================================================================
+    # TELA 6: RESULTADO DA RODADA (SHOWDOWN)
+    # =========================================================================
+    def _criar_tela_showdown(self):
+        f = tk.Frame(self.root, bg=COR_BG)
+        self.frame_showdown = f
+
+        self.lbl_show_titulo = tk.Label(
+            f,
+            text="RESULTADO DA RODADA",
+            fg="#FFD54F",
+            bg=COR_BG,
+            font=("DejaVu Sans", 12, "bold"),
+        )
+        self.lbl_show_titulo.pack(pady=(5, 2))
+
+        self.row_cartas_show = tk.Frame(f, bg=COR_BG)
+        self.row_cartas_show.pack(pady=2)
+
+        self.scroll_showdown = ScrollableTouchFrame(f, bg=COR_BG)
+        self.scroll_showdown.pack(fill="both", expand=True, padx=6, pady=3)
+
+        rodape = tk.Frame(f, bg=COR_BG, height=48)
+        rodape.pack(fill="x", padx=8, pady=(2, 6))
+        rodape.pack_propagate(False)
+
+        tk.Button(
+            rodape,
+            text="Encerrar Jogo",
+            command=lambda: self.servidor.ui_encerrar_jogo(),
+            bg="#C62828",
+            fg="#FFFFFF",
+            activebackground="#8E0000",
+            font=("DejaVu Sans", 11, "bold"),
+            bd=0,
+            highlightthickness=0,
+        ).pack(side="left", fill="both", expand=True, padx=(0, 6))
+
+        self.btn_nova_rodada = tk.Button(
+            rodape,
+            text="Nova Rodada",
+            command=lambda: self.servidor.ui_iniciar_rodada(),
+            bg="#2E7D32",
+            fg="#FFFFFF",
+            activebackground="#1B5E20",
+            disabledforeground="#888888",
+            font=("DejaVu Sans", 12, "bold"),
+            bd=0,
+            highlightthickness=0,
+        )
+        self.btn_nova_rodada.pack(side="right", fill="both", expand=True, padx=(6, 0))
+
+    # =========================================================================
+    # TELA 7: PLACAR FINAL DA SESSÃO
+    # =========================================================================
+    def _criar_tela_placar(self):
+        f = tk.Frame(self.root, bg=COR_BG)
+        self.frame_placar = f
+
+        tk.Label(
+            f,
+            text="PLACAR FINAL DA MESA",
+            fg="#FFD54F",
+            bg=COR_BG,
+            font=("DejaVu Sans", 13, "bold"),
+        ).pack(pady=(6, 4))
+
+        self.scroll_placar = ScrollableTouchFrame(f, bg=COR_BG)
+        self.scroll_placar.pack(fill="both", expand=True, padx=6, pady=2)
+
+        tk.Button(
+            f,
+            text="Voltar ao Início (Nova Mesa)",
+            command=lambda: self.servidor.ui_voltar_inicio(),
+            bg="#1565C0",
+            fg="#FFFFFF",
+            activebackground="#0D47A1",
+            font=("DejaVu Sans", 12, "bold"),
+            bd=0,
+            highlightthickness=0,
+            height=2,
+        ).pack(fill="x", padx=12, pady=8)
+
+    # =========================================================================
+    # OVERLAY GLOBAL DE CONFIRMAÇÃO DE DESLIGAMENTO
+    # =========================================================================
+    def _criar_overlay_desligamento(self):
+        self.frame_desligar = tk.Frame(self.root, bg="#1A1A1A")
+
+        self.lbl_desligar_msg = tk.Label(
+            self.frame_desligar,
+            text="Deseja realmente desligar\no Raspberry Pi?",
+            fg="#FFFFFF",
+            bg="#1A1A1A",
+            font=("DejaVu Sans", 16, "bold"),
+            justify="center",
+        )
+        self.lbl_desligar_msg.pack(expand=True, pady=(35, 10))
+
+        self.box_btns_desligar = tk.Frame(self.frame_desligar, bg="#1A1A1A")
+        self.box_btns_desligar.pack(fill="x", padx=24, pady=(0, 35))
+
+        tk.Button(
+            self.box_btns_desligar,
+            text="Cancelar",
+            command=self._ocultar_confirmacao_desligar,
+            bg="#424242",
+            fg="#FFFFFF",
+            activebackground="#616161",
+            font=("DejaVu Sans", 14, "bold"),
+            bd=0,
+            highlightthickness=0,
+            height=3,
+        ).pack(side="left", expand=True, fill="x", padx=(0, 10))
+
+        tk.Button(
+            self.box_btns_desligar,
+            text="Confirmar",
+            command=self._executar_desligamento,
+            bg="#C62828",
+            fg="#FFFFFF",
+            activebackground="#8E0000",
+            font=("DejaVu Sans", 14, "bold"),
+            bd=0,
+            highlightthickness=0,
+            height=3,
+        ).pack(side="right", expand=True, fill="x", padx=(10, 0))
+
+    # =========================================================================
+    # CONTROLE DE TELAS E RENDERIZAÇÃO DO ESTADO
+    # =========================================================================
+    def _mostrar_tela(self, nome: str, frame: tk.Frame):
+        if self.tela_ativa == nome:
+            return
+        for f in (
+            self.frame_lobby,
+            self.frame_distribuir_mao,
+            self.frame_distribuir_mesa,
+            self.frame_jogo,
+            self.frame_virar_mesa,
+            self.frame_showdown,
+            self.frame_placar,
+        ):
+            f.place_forget()
+        frame.place(x=0, y=ALTURA_HEADER, width=LARGURA, height=ALTURA_CORPO)
+        frame.tkraise()
+        self.header.tkraise()
+        self.tela_ativa = nome
+
+    def _processar_fila_ui(self):
+        atualizar = False
+        while not self.fila_ui.empty():
+            try:
+                self.fila_ui.get_nowait()
+                atualizar = True
+            except queue.Empty:
+                break
+        if atualizar:
+            self._renderizar_estado()
+        self.root.after(60, self._processar_fila_ui)
+
+    def _renderizar_estado(self):
+        s = self.servidor.obter_snapshot()
+        fase = s["fase"]
+
+        if fase == "AGUARDANDO":
+            self.lbl_header_titulo.config(text=f"LOBBY • {self.ip_local}:5000")
+            self._mostrar_tela("LOBBY", self.frame_lobby)
+            self._atualizar_lobby(s)
+
+        elif fase == "DISTRIBUINDO_MAOS":
+            self.lbl_header_titulo.config(
+                text=f"RODADA #{s['numero_rodada']} • DISTRIBUIR MÃOS"
+            )
+            self._mostrar_tela("DIST_MAO", self.frame_distribuir_mao)
+            self._atualizar_distribuir_mao(s)
+
+        elif fase == "DISTRIBUINDO_MESA":
+            self.lbl_header_titulo.config(
+                text=f"RODADA #{s['numero_rodada']} • CARTAS DA MESA"
+            )
+            self._mostrar_tela("DIST_MESA", self.frame_distribuir_mesa)
+            self._atualizar_distribuir_mesa(s)
+
+        elif fase in ("PRE_FLOP", "FLOP", "TURN", "RIVER"):
+            nomes_fase = {
+                "PRE_FLOP": "PRÉ-FLOP",
+                "FLOP": "FLOP",
+                "TURN": "TURN",
+                "RIVER": "RIVER",
+            }
+            self.lbl_header_titulo.config(
+                text=f"RODADA #{s['numero_rodada']} • {nomes_fase[fase]} • Mesa R${fmt_valor(s['montante_total'])}"
+            )
+            self._mostrar_tela("JOGO", self.frame_jogo)
+            self._atualizar_jogo(s)
+
+        elif fase in (
+            "AGUARDANDO_VIRAR_FLOP",
+            "AGUARDANDO_VIRAR_TURN",
+            "AGUARDANDO_VIRAR_RIVER",
+        ):
+            self.lbl_header_titulo.config(
+                text=f"RODADA #{s['numero_rodada']} • AÇÃO DO DEALER"
+            )
+            self._mostrar_tela("VIRAR", self.frame_virar_mesa)
+            self._atualizar_virar_mesa(s)
+
+        elif fase == "SHOWDOWN":
+            self.lbl_header_titulo.config(
+                text=f"RODADA #{s['numero_rodada']} • FINALIZADA"
+            )
+            self._mostrar_tela("SHOWDOWN", self.frame_showdown)
+            self._atualizar_showdown(s)
+
+        elif fase == "PLACAR_FINAL":
+            self.lbl_header_titulo.config(text="SESSÃO ENCERRADA • PLACAR")
+            self._mostrar_tela("PLACAR", self.frame_placar)
+            self._atualizar_placar(s)
+
+    def _atualizar_lobby(self, s: dict):
+        self.lbl_lobby_total.config(text=f"Mesa: R$ {fmt_valor(s['montante_total'])}")
+        self.lbl_blinds.config(
+            text=f"SB/BB: {fmt_valor(s['small_blind'])}/{fmt_valor(s['big_blind'])}"
+        )
+
+        if s["bot_ativo"]:
+            self.btn_bot.config(text="Bot Teste: ON", bg="#1976D2")
+        else:
+            self.btn_bot.config(text="Bot Teste: OFF", bg="#455A64")
+
+        self.btn_iniciar.config(
+            state="normal" if s["pode_iniciar"] else "disabled",
+            bg="#2E7D32" if s["pode_iniciar"] else "#333333",
+        )
+
+        self.scroll_lobby.limpar()
+        jogadores = s["jogadores"]
+        if not jogadores:
+            lbl = tk.Label(
+                self.scroll_lobby.inner,
+                text="Aguardando jogadores conectarem\npelo aplicativo Android...",
+                fg=COR_SUB,
+                bg=COR_BG,
+                font=("DejaVu Sans", 12),
+                justify="center",
+                pady=45,
+            )
+            lbl.pack(fill="x")
+            self.scroll_lobby.vincular_filhos_recursivo(lbl)
+            return
+
+        total = len(jogadores)
+        for idx, j in enumerate(jogadores):
+            cor = COR_CARD if idx % 2 == 0 else COR_CARD_ALT
+            linha = tk.Frame(self.scroll_lobby.inner, bg=cor, height=40)
+            linha.pack(fill="x", pady=2, padx=2)
+            linha.pack_propagate(False)
+
+            tk.Label(
+                linha,
+                text=f"{j['pos']}. {j['nome']}",
+                fg="#81D4FA" if j["is_bot"] else COR_TEXTO,
+                bg=cor,
+                font=("DejaVu Sans", 11, "bold"),
+                anchor="w",
+            ).pack(side="left", padx=8, fill="x", expand=True)
+
+            tk.Label(
+                linha,
+                text=f"R$ {fmt_valor(j['saldo'])}",
+                fg="#69F0AE",
+                bg=cor,
+                font=("DejaVu Sans", 11, "bold"),
+            ).pack(side="left", padx=6)
+
+            jid = j["id"]
+            tk.Button(
+                linha,
+                text="▲",
+                command=lambda target=jid: self.servidor.ui_mover_jogador(target, -1),
+                state="normal" if idx > 0 else "disabled",
+                bg="#37474F" if idx > 0 else "#222222",
+                fg="#FFFFFF",
+                disabledforeground="#555555",
+                font=("DejaVu Sans", 10, "bold"),
+                width=3,
+                bd=0,
+                highlightthickness=0,
+            ).pack(side="left", padx=2, pady=4, fill="y")
+
+            tk.Button(
+                linha,
+                text="▼",
+                command=lambda target=jid: self.servidor.ui_mover_jogador(target, 1),
+                state="normal" if idx < total - 1 else "disabled",
+                bg="#37474F" if idx < total - 1 else "#222222",
+                fg="#FFFFFF",
+                disabledforeground="#555555",
+                font=("DejaVu Sans", 10, "bold"),
+                width=3,
+                bd=0,
+                highlightthickness=0,
+            ).pack(side="left", padx=(2, 6), pady=4, fill="y")
+
+            self.scroll_lobby.vincular_filhos_recursivo(linha)
+
+    def _atualizar_distribuir_mao(self, s: dict):
+        qtd = s["buffer_qtd"]
+        self.lbl_dist_progresso.config(
+            text=f"CARTAS PRIVADAS • Jogador {s['alvo_idx']} de {s['alvo_total']}"
+        )
+        self.lbl_dist_nome.config(text=s["alvo_nome"])
+        self.lbl_dist_contador.config(
+            text=f"{qtd} / 2 cartas lidas",
+            fg="#69F0AE" if qtd == 2 else "#FFD54F",
+        )
+        self.lbl_dist_aviso.config(text=s["aviso_scanner"])
+        pronto = qtd == 2
+        self.btn_confirmar_mao.config(
+            state="normal" if pronto else "disabled",
+            bg="#2E7D32" if pronto else "#333333",
+        )
+
+    def _atualizar_distribuir_mesa(self, s: dict):
+        qtd = s["buffer_qtd"]
+        for i, lbl in enumerate(self.slots_ocultos_lbls):
+            if i < qtd:
+                lbl.config(text="✓", fg="#FFFFFF", bg="#2E7D32")
+            else:
+                lbl.config(text="?", fg="#78909C", bg="#263238")
+
+        self.lbl_mesa_contador.config(
+            text=f"{qtd} / 5 cartas lidas",
+            fg="#69F0AE" if qtd == 5 else "#FFD54F",
+        )
+        self.lbl_mesa_aviso.config(text=s["aviso_scanner"])
+        pronto = qtd == 5
+        self.btn_confirmar_mesa.config(
+            state="normal" if pronto else "disabled",
+            bg="#2E7D32" if pronto else "#333333",
+        )
+
+    def _atualizar_jogo(self, s: dict):
+        self.lbl_jogo_vez.config(text=s["jogador_vez_nome"])
+        extra_side = f" (+{s['qtd_side_pots']} Side)" if s["qtd_side_pots"] > 0 else ""
+        self.lbl_jogo_pote.config(text=f"POTE: R$ {fmt_valor(s['pote'])}{extra_side}")
+        self.lbl_jogo_aposta.config(
+            text=f"Aposta atual: R$ {fmt_valor(s['aposta_atual'])}"
+        )
+        self.lbl_jogo_msg.config(text=s["ultima_acao_msg"])
+
+        reveladas = s["cartas_mesa_reveladas"]
+        for i, lbl in enumerate(self.slots_cartas_jogo):
+            if i < len(reveladas):
+                txt, cor = formatar_carta(reveladas[i])
+                lbl.config(text=txt, fg=cor, bg="#FFFFFF")
+            else:
+                lbl.config(text="?", fg="#78909C", bg="#263238")
+
+        self.scroll_jogo.limpar()
+        for idx, j in enumerate(s["jogadores"]):
+            cor = (
+                "#1B3B2B"
+                if j["eh_vez"]
+                else (COR_CARD if idx % 2 == 0 else COR_CARD_ALT)
+            )
+            linha = tk.Frame(self.scroll_jogo.inner, bg=cor, height=32)
+            linha.pack(fill="x", pady=1, padx=2)
+            linha.pack_propagate(False)
+
+            tag = f"[{j['tags']}] " if j["tags"] else ""
+            seta = "▶ " if j["eh_vez"] else ""
+            tk.Label(
+                linha,
+                text=f"{seta}{tag}{j['nome']}",
+                fg="#69F0AE" if j["eh_vez"] else COR_TEXTO,
+                bg=cor,
+                font=("DejaVu Sans", 10, "bold"),
+                anchor="w",
+            ).pack(side="left", padx=6, fill="x", expand=True)
+
+            tk.Label(
+                linha,
+                text=f"R${fmt_valor(j['saldo'])} (Ap:{fmt_valor(j['aposta_rodada'])})",
+                fg="#FFD54F",
+                bg=cor,
+                font=("DejaVu Sans", 9),
+            ).pack(side="left", padx=4)
+
+            cor_st = {
+                "ATIVO": "#81C784",
+                "ALL-IN": "#FFAB40",
+                "FOLD": "#EF5350",
+                "ESPERA": "#90CAF9",
+            }.get(j["status"], COR_SUB)
+            tk.Label(
+                linha,
+                text=j["status"],
+                fg=cor_st,
+                bg=cor,
+                font=("DejaVu Sans", 9, "bold"),
+                width=8,
+                anchor="e",
+            ).pack(side="right", padx=6)
+
+            self.scroll_jogo.vincular_filhos_recursivo(linha)
+
+    def _atualizar_virar_mesa(self, s: dict):
+        titulos = {
+            "AGUARDANDO_VIRAR_FLOP": "VIRE AS 3 CARTAS\nDO FLOP",
+            "AGUARDANDO_VIRAR_TURN": "VIRE A 4ª CARTA\n(TURN)",
+            "AGUARDANDO_VIRAR_RIVER": "VIRE A 5ª CARTA\n(RIVER)",
+        }
+        self.lbl_virar_titulo.config(text=titulos.get(s["fase"], "VIRE AS CARTAS"))
+        self.lbl_virar_pote.config(text=f"Pote atual: R$ {fmt_valor(s['pote'])}")
+
+    def _atualizar_showdown(self, s: dict):
+        for w in self.row_cartas_show.winfo_children():
+            w.destroy()
+        for c in s["cartas_mesa_reveladas"]:
+            txt, cor = formatar_carta(c)
+            tk.Label(
+                self.row_cartas_show,
+                text=txt,
+                fg=cor,
+                bg="#FFFFFF",
+                font=("DejaVu Sans", 11, "bold"),
+                padx=6,
+                pady=2,
+            ).pack(side="left", padx=3)
+
+        self.scroll_showdown.limpar()
+        for item in s["resultado_rodada"]:
+            box = tk.Frame(self.scroll_showdown.inner, bg=COR_CARD, pady=6, padx=8)
+            box.pack(fill="x", pady=3, padx=2)
+
+            vencedores = ", ".join(item["vencedores"])
+            tk.Label(
+                box,
+                text=f"{item['pote_nome']} — {vencedores}",
+                fg="#69F0AE",
+                bg=COR_CARD,
+                font=("DejaVu Sans", 11, "bold"),
+                anchor="w",
+            ).pack(fill="x")
+
+            tk.Label(
+                box,
+                text=f"Recebeu R$ {fmt_valor(item['premio_cada'])} cada • {item['combinacao']}",
+                fg=COR_TEXTO,
+                bg=COR_CARD,
+                font=("DejaVu Sans", 10),
+                anchor="w",
+            ).pack(fill="x")
+            self.scroll_showdown.vincular_filhos_recursivo(box)
+
+        # Lista rápida de saldos atualizados e jogadores aguardando rebuy/espera
+        sep = tk.Label(
+            self.scroll_showdown.inner,
+            text="Saldos atuais (jogadores podem fazer Rebuy no celular):",
+            fg=COR_SUB,
+            bg=COR_BG,
+            font=("DejaVu Sans", 9),
+            anchor="w",
+            pady=4,
+        )
+        sep.pack(fill="x", padx=4)
+        self.scroll_showdown.vincular_touch(sep)
+
+        for j in s["jogadores"]:
+            linha = tk.Frame(self.scroll_showdown.inner, bg="#1A1A1A", height=26)
+            linha.pack(fill="x", pady=1, padx=2)
+            linha.pack_propagate(False)
+            extra = " [ESPERA]" if j["status"] == "ESPERA" else ""
+            tk.Label(
+                linha,
+                text=f"{j['nome']}{extra}",
+                fg=COR_TEXTO,
+                bg="#1A1A1A",
+                font=("DejaVu Sans", 9, "bold"),
+                anchor="w",
+            ).pack(side="left", padx=8)
+            tk.Label(
+                linha,
+                text=f"R$ {fmt_valor(j['saldo'])}",
+                fg="#EF5350" if j["saldo"] <= 0 else "#FFD54F",
+                bg="#1A1A1A",
+                font=("DejaVu Sans", 9, "bold"),
+            ).pack(side="right", padx=8)
+            self.scroll_showdown.vincular_filhos_recursivo(linha)
+
+        self.btn_nova_rodada.config(
+            state="normal" if s["pode_iniciar"] else "disabled",
+            bg="#2E7D32" if s["pode_iniciar"] else "#333333",
+        )
+
+    def _atualizar_placar(self, s: dict):
+        self.scroll_placar.limpar()
+        for idx, item in enumerate(s["placar_final"]):
+            cor = COR_CARD if idx % 2 == 0 else COR_CARD_ALT
+            linha = tk.Frame(self.scroll_placar.inner, bg=cor, height=42)
+            linha.pack(fill="x", pady=2, padx=2)
+            linha.pack_propagate(False)
+
+            lucro = item["lucro"]
+            if lucro > 0:
+                txt_lucro = f"+R$ {fmt_valor(lucro)}"
+                cor_lucro = "#69F0AE"
+            elif lucro < 0:
+                txt_lucro = f"-R$ {fmt_valor(abs(lucro))}"
+                cor_lucro = "#EF5350"
+            else:
+                txt_lucro = "R$ 0"
+                cor_lucro = COR_SUB
+
+            tk.Label(
+                linha,
+                text=f"{idx + 1}º  {item['nome']}",
+                fg=COR_TEXTO,
+                bg=cor,
+                font=("DejaVu Sans", 11, "bold"),
+                anchor="w",
+            ).pack(side="left", padx=8, fill="x", expand=True)
+
+            tk.Label(
+                linha,
+                text=f"Saldo: R$ {fmt_valor(item['saldo_final'])}",
+                fg="#FFD54F",
+                bg=cor,
+                font=("DejaVu Sans", 10),
+            ).pack(side="left", padx=6)
+
+            tk.Label(
+                linha,
+                text=txt_lucro,
+                fg=cor_lucro,
+                bg=cor,
+                font=("DejaVu Sans", 11, "bold"),
+                width=10,
+                anchor="e",
+            ).pack(side="right", padx=8)
+
+            self.scroll_placar.vincular_filhos_recursivo(linha)
+
+    # =========================================================================
+    # DESLIGAMENTO SEGURO DO RASPBERRY PI
+    # =========================================================================
+    def _mostrar_confirmacao_desligar(self):
+        self.frame_desligar.place(x=0, y=0, width=LARGURA, height=ALTURA)
+        self.frame_desligar.tkraise()
+
+    def _ocultar_confirmacao_desligar(self):
+        self.frame_desligar.place_forget()
+
+    def _executar_desligamento(self):
+        self.box_btns_desligar.pack_forget()
+        self.lbl_desligar_msg.config(
+            text="Encerrando scanner, servidor\ne desligando o Raspberry Pi...\nAguarde o LED verde apagar.",
+            fg="#FFB74D",
+            font=("DejaVu Sans", 13, "bold"),
+        )
+        self.root.update()
+        self.servidor.encerrar()
+        self.root.after(
+            300,
+            lambda: subprocess.run(
+                ["sudo", "/usr/sbin/shutdown", "-h", "now"], check=False
+            ),
+        )
+
+    def _sair_app(self):
+        self.servidor.encerrar()
+        self.root.destroy()
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    InterfacePokerLCD(root)
+    root.mainloop()
+
+=== ./servidor_pi/servidor_mesa.py ===
+import socket
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+from protocolo import desempacotar, empacotar
+from regras_de_negocio import BOT_ID, JogoPoker
+
+MAPA_VALORES = {"10": "T", "A": "A", "J": "J", "Q": "Q", "K": "K"}
+MAPA_NAIPES = {"Copas": "h", "Ouros": "d", "Espadas": "s", "Paus": "c"}
+
+
+def traduzir_carta(valor: str, naipe: str) -> str:
+    v = MAPA_VALORES.get(valor, valor)
+    n = MAPA_NAIPES.get(naipe, "")
+    return f"{v}{n}"
+
+
+def obter_ip_local() -> str:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+
+
+class ServidorMesa:
+    def __init__(self, porta: int = 5000, on_atualizar_ui=None):
+        self.porta = porta
+        self.on_atualizar_ui = on_atualizar_ui
+        self.jogo = JogoPoker()
+        self.lock = threading.Lock()
+
+        self._rodando = False
+        self._sock_servidor = None
+        self._processo_scanner = None
+        self._camera_ligada = False
+        self._bot_agendado = False
+
+        self.roteador = {
+            "registro": lambda conn, d: self.jogo.registrar_jogador(
+                conn, d.get("nome", "Jogador"), d.get("saldo", 1000)
+            ),
+            "acao": lambda conn, d: self.jogo.processar_acao(
+                conn, d.get("acao", ""), float(d.get("valor", 0))
+            ),
+            "rebuy": lambda conn, d: self.jogo.processar_rebuy(
+                conn, float(d.get("valor", 0))
+            ),
+        }
+
+    # =========================================================================
+    # CICLO DE VIDA (INICIAR / ENCERRAR COM SEGURANÇA)
+    # =========================================================================
+    def iniciar(self) -> None:
+        self._rodando = True
+        threading.Thread(target=self._loop_sockets, daemon=True).start()
+        self._iniciar_scanner()
+        self._notificar_ui()
+
+    def encerrar(self) -> None:
+        """Desliga LED/IR/câmera no scanner e fecha todos os sockets com segurança."""
+        self._rodando = False
+
+        # 1. Encerra o processo do scanner (desliga GPIO LED/IR e fecha câmera)
+        if self._processo_scanner is not None:
+            try:
+                if self._processo_scanner.stdin:
+                    self._processo_scanner.stdin.write(b"SAIR\n")
+                    self._processo_scanner.stdin.flush()
+                self._processo_scanner.wait(timeout=3)
+            except Exception:
+                try:
+                    self._processo_scanner.terminate()
+                except Exception:
+                    pass
+            self._processo_scanner = None
+
+        # 2. Fecha sockets de clientes e servidor
+        with self.lock:
+            for jid in list(self.jogo.jogadores.keys()):
+                if isinstance(jid, socket.socket):
+                    try:
+                        jid.close()
+                    except Exception:
+                        pass
+
+        if self._sock_servidor is not None:
+            try:
+                self._sock_servidor.close()
+            except Exception:
+                pass
+            self._sock_servidor = None
+
+    # =========================================================================
+    # COMUNICAÇÃO COM O SUBPROCESSO DO SCANNER
+    # =========================================================================
+    def _iniciar_scanner(self) -> None:
+        script_scanner = Path(__file__).resolve().parent / "scanner_integrado.py"
+        try:
+            self._processo_scanner = subprocess.Popen(
+                [sys.executable, str(script_scanner)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=sys.stderr,
+            )
+            threading.Thread(target=self._loop_scanner, daemon=True).start()
+        except Exception as e:
+            print(f"[Servidor] Falha ao iniciar scanner_integrado.py: {e}")
+
+    def _enviar_cmd_scanner(self, cmd: str) -> None:
+        proc = self._processo_scanner
+        if proc is not None and proc.poll() is None and proc.stdin is not None:
+            try:
+                proc.stdin.write(f"{cmd}\n".encode("utf-8"))
+                proc.stdin.flush()
+            except Exception:
+                pass
+
+    def _sincronizar_scanner_com_fase(self) -> None:
+        """Liga câmera/LED apenas na fase de escaneamento e sincroniza cartas usadas."""
+        precisa_scanner = self.jogo.fase in ("DISTRIBUINDO_MAOS", "DISTRIBUINDO_MESA")
+        if precisa_scanner and not self._camera_ligada:
+            self._camera_ligada = True
+            self._enviar_cmd_scanner("LIGAR")
+        elif not precisa_scanner and self._camera_ligada:
+            self._camera_ligada = False
+            self._enviar_cmd_scanner("DESLIGAR")
+
+        lista_usadas = ",".join(sorted(self.jogo.cartas_usadas_rodada))
+        self._enviar_cmd_scanner(f"USADAS;{lista_usadas}")
+
+    def _loop_scanner(self) -> None:
+        proc = self._processo_scanner
+        if proc is None or proc.stdout is None:
+            return
+        for linha in proc.stdout:
+            if not self._rodando:
+                break
+            evento = linha.decode("utf-8", errors="ignore").strip()
+            if not evento:
+                continue
+
+            print(f"[Scanner] {evento}")
+            if evento.startswith("CARTA;"):
+                partes = evento.split(";")
+                if len(partes) == 3:
+                    carta = traduzir_carta(partes[1], partes[2])
+                    with self.lock:
+                        msgs = self.jogo.processar_carta_lida(carta)
+                        self._sincronizar_scanner_com_fase()
+                    self._despachar(msgs)
+                    self._notificar_ui()
+
+            elif evento.startswith("DUPLICADA;"):
+                with self.lock:
+                    self.jogo.registrar_aviso_duplicada()
+                self._notificar_ui()
+
+    # =========================================================================
+    # REDE TCP (CELULARES ANDROID)
+    # =========================================================================
+    def _loop_sockets(self) -> None:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("0.0.0.0", self.porta))
+        srv.listen()
+        srv.settimeout(1.0)
+        self._sock_servidor = srv
+        print(f"[Rede] Servidor Poker rodando na porta {self.porta}...")
+
+        while self._rodando:
+            try:
+                conn, addr = srv.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            threading.Thread(
+                target=self._atender_cliente, args=(conn, addr), daemon=True
+            ).start()
+
+    def _atender_cliente(self, conn: socket.socket, addr) -> None:
+        print(f"[Rede] Celular conectado: {addr}")
+        try:
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except Exception:
+            pass
+        buffer = ""
+        try:
+            while self._rodando:
+                dados_brutos = conn.recv(1024).decode("utf-8")
+                if not dados_brutos:
+                    break
+                buffer += dados_brutos
+                while "\n" in buffer:
+                    linha, buffer = buffer.split("\n", 1)
+                    if not linha.strip():
+                        continue
+                    tipo, dados = desempacotar(linha)
+                    handler = self.roteador.get(tipo)
+                    if handler:
+                        with self.lock:
+                            msgs = handler(conn, dados)
+                            self._sincronizar_scanner_com_fase()
+                            precisa_bot = self.jogo.jogador_da_vez_eh_bot()
+                        self._despachar(msgs)
+                        self._notificar_ui()
+                        if precisa_bot:
+                            self._agendar_jogada_bot()
+        except Exception as e:
+            print(f"[Rede] Erro com cliente {addr}: {e}")
+        finally:
+            with self.lock:
+                msgs = self.jogo.remover_jogador(conn)
+                self._sincronizar_scanner_com_fase()
+                precisa_bot = self.jogo.jogador_da_vez_eh_bot()
+            self._despachar(msgs)
+            self._notificar_ui()
+            if precisa_bot:
+                self._agendar_jogada_bot()
+            try:
+                conn.close()
+            except Exception:
+                pass
+            print(f"[Rede] Celular desconectado: {addr}")
+
+    def _despachar(self, mensagens: list[tuple]) -> None:
+        if not mensagens:
+            return
+        with self.lock:
+            sockets_humanos = [
+                jid
+                for jid in self.jogo.jogadores.keys()
+                if isinstance(jid, socket.socket)
+            ]
+
+        lotes_por_conn: dict[socket.socket, list[bytes]] = {}
+        for destino, tipo, dados in mensagens:
+            payload = empacotar(tipo, **dados)
+            if destino == "TODOS":
+                destinatarios = sockets_humanos
+            elif isinstance(destino, socket.socket):
+                destinatarios = [destino]
+            else:
+                continue
+
+            for conn in destinatarios:
+                lotes_por_conn.setdefault(conn, []).append(payload)
+
+        for conn, pacotes in lotes_por_conn.items():
+            try:
+                conn.sendall(b"".join(pacotes))
+            except Exception:
+                pass
+
+    # =========================================================================
+    # BOT DE TESTES (AGENDAMENTO ASSÍNCRONO)
+    # =========================================================================
+    def _agendar_jogada_bot(self) -> None:
+        with self.lock:
+            if self._bot_agendado or not self._rodando:
+                return
+            self._bot_agendado = True
+
+        def executar():
+            time.sleep(1.1)
+            if not self._rodando:
+                return
+            with self.lock:
+                self._bot_agendado = False
+                if not self.jogo.jogador_da_vez_eh_bot():
+                    return
+                acao, valor = self.jogo.escolher_acao_bot()
+                msgs = self.jogo.processar_acao(BOT_ID, acao, valor)
+                self._sincronizar_scanner_com_fase()
+                novo_turno_bot = self.jogo.jogador_da_vez_eh_bot()
+
+            self._despachar(msgs)
+            self._notificar_ui()
+            if novo_turno_bot:
+                self._agendar_jogada_bot()
+
+        threading.Thread(target=executar, daemon=True).start()
+
+    # =========================================================================
+    # AÇÕES ACIONADAS PELOS BOTÕES DA INTERFACE LCD
+    # =========================================================================
+    def obter_snapshot(self) -> dict:
+        with self.lock:
+            return self.jogo.obter_snapshot_ui()
+
+    def ui_ajustar_blinds(self, delta: int) -> None:
+        with self.lock:
+            self.jogo.ajustar_blinds(delta)
+            msgs = self.jogo._gerar_estado_individualizado(
+                f"Blinds ajustados: SB R${self.jogo.small_blind:.0f} / BB R${self.jogo.big_blind:.0f}."
+            )
+        self._despachar(msgs)
+        self._notificar_ui()
+
+    def ui_alternar_bot(self) -> None:
+        with self.lock:
+            msgs = self.jogo.alternar_bot_testes()
+        self._despachar(msgs)
+        self._notificar_ui()
+
+    def ui_mover_jogador(self, jid, direcao: int) -> None:
+        with self.lock:
+            msgs = self.jogo.mover_jogador(jid, direcao)
+        self._despachar(msgs)
+        self._notificar_ui()
+
+    def ui_iniciar_rodada(self) -> None:
+        with self.lock:
+            msgs = self.jogo.iniciar_nova_rodada()
+            self._sincronizar_scanner_com_fase()
+            self._enviar_cmd_scanner("RESET_LEITURA")
+        self._despachar(msgs)
+        self._notificar_ui()
+
+    def ui_limpar_leitura(self) -> None:
+        with self.lock:
+            self.jogo.limpar_buffer_atual()
+            self._sincronizar_scanner_com_fase()
+            self._enviar_cmd_scanner("RESET_LEITURA")
+        self._notificar_ui()
+
+    def ui_confirmar_distribuicao(self) -> None:
+        with self.lock:
+            msgs = self.jogo.confirmar_distribuicao_atual()
+            self._sincronizar_scanner_com_fase()
+            self._enviar_cmd_scanner("RESET_LEITURA")
+            precisa_bot = self.jogo.jogador_da_vez_eh_bot()
+        self._despachar(msgs)
+        self._notificar_ui()
+        if precisa_bot:
+            self._agendar_jogada_bot()
+
+    def ui_confirmar_virar_mesa(self) -> None:
+        with self.lock:
+            msgs = self.jogo.confirmar_virar_cartas_mesa()
+            precisa_bot = self.jogo.jogador_da_vez_eh_bot()
+        self._despachar(msgs)
+        self._notificar_ui()
+        if precisa_bot:
+            self._agendar_jogada_bot()
+
+    def ui_encerrar_jogo(self) -> None:
+        with self.lock:
+            msgs = self.jogo.encerrar_jogo()
+            self._sincronizar_scanner_com_fase()
+        self._despachar(msgs)
+        self._notificar_ui()
+
+    def ui_voltar_inicio(self) -> None:
+        with self.lock:
+            msgs = self.jogo.voltar_ao_inicio()
+            self._sincronizar_scanner_com_fase()
+        self._despachar(msgs)
+        self._notificar_ui()
+
+    def _notificar_ui(self) -> None:
+        if self.on_atualizar_ui:
+            self.on_atualizar_ui()
+
+=== ./cliente_android/pyproject.toml ===
+[project]
+name = "pokertable"
+version = "0.1.0"
+dependencies = [
+    "flet",
+    "pyjnius>=1.9.0",
+]
+
+[tool.flet]
+org = "com.poker"
+product = "PokerTable"
+
+[tool.flet.app]
+path = "src"
+
+
+=== ./cliente_android/src/protocolo.py ===
+import json
+
+
+def empacotar(tipo: str, **dados) -> bytes:
+    """Cria uma mensagem padronizada no formato {'tipo': ..., 'dados': {...}}\n."""
+    envelope = {"tipo": tipo, "dados": dados}
+    return (json.dumps(envelope) + "\n").encode("utf-8")
+
+
+def desempacotar(linha: str) -> tuple[str, dict]:
+    """Extrai (tipo, dados) de uma linha JSON recebida pelo socket."""
+    envelope = json.loads(linha)
+    return envelope.get("tipo", ""), envelope.get("dados", {})
+
+=== ./cliente_android/src/main.py ===
+import re
+import socket
+import threading
+from itertools import combinations
+import flet as ft
+from protocolo import desempacotar, empacotar
+
+SALDO_MIN = 200.0
+SALDO_MAX = 10000.0
+
+ICONES_NAIPE = {
+    "s": "♠",
+    "h": "♥",
+    "d": "♦",
+    "c": "♣",
+}
+
+NOMES_VALORES_TTS = {
+    "A": "Ás",
+    "2": "Dois",
+    "3": "Três",
+    "4": "Quatro",
+    "5": "Cinco",
+    "6": "Seis",
+    "7": "Sete",
+    "8": "Oito",
+    "9": "Nove",
+    "T": "Dez",
+    "10": "Dez",
+    "J": "Valete",
+    "Q": "Dama",
+    "K": "Rei",
+}
+
+NOMES_NAIPES_TTS = {
+    "h": "Copas",
+    "d": "Ouros",
+    "s": "Espadas",
+    "c": "Paus",
+}
+
+VALORES_MAP = {
+    "2": 2,
+    "3": 3,
+    "4": 4,
+    "5": 5,
+    "6": 6,
+    "7": 7,
+    "8": 8,
+    "9": 9,
+    "T": 10,
+    "J": 11,
+    "Q": 12,
+    "K": 13,
+    "A": 14,
+}
+NOMES_COMBINACOES = [
+    "Carta Alta",
+    "Um Par",
+    "Dois Pares",
+    "Trinca",
+    "Sequência",
+    "Flush",
+    "Full House",
+    "Quadra",
+    "Straight Flush",
+]
+
+
+class AndroidTTS:
+    """Wrapper para o Text-to-Speech nativo do Android via Pyjnius."""
+
+    def __init__(self):
+        self.ativo = True
+        self._tts = None
+        self._idioma_configurado = False
+        self._queue_add = 1
+        self._queue_flush = 0
+        self._utterance_id = 0
+        self._lock = threading.Lock()
+        self._inicializar_android()
+
+    def _inicializar_android(self):
+        try:
+            from jnius import autoclass
+
+            ActivityThread = autoclass("android.app.ActivityThread")
+            TextToSpeech = autoclass("android.speech.tts.TextToSpeech")
+
+            app = ActivityThread.currentApplication()
+            if app is None:
+                return
+            context = app.getApplicationContext()
+
+            self._queue_add = TextToSpeech.QUEUE_ADD
+            self._queue_flush = TextToSpeech.QUEUE_FLUSH
+            self._tts = TextToSpeech(context, None)
+            self._garantir_idioma()
+        except Exception as e:
+            print(f"[TTS] Modo desktop/fallback: {e}")
+            self._tts = None
+
+    def _garantir_idioma(self):
+        if self._tts is not None and not self._idioma_configurado:
+            self._idioma_configurado = True
+            try:
+                from jnius import autoclass
+
+                Locale = autoclass("java.util.Locale")
+                res = self._tts.setLanguage(Locale("pt", "BR"))
+                if res < 0:
+                    self._tts.setLanguage(Locale.getDefault())
+            except Exception:
+                pass
+
+    def falar(self, texto: str, interromper: bool = False):
+        texto = texto.strip()
+        if not texto or not self.ativo:
+            return
+
+        with self._lock:
+            self._utterance_id += 1
+            uid = f"poker_tts_{self._utterance_id}"
+
+        if self._tts is not None:
+            try:
+                self._garantir_idioma()
+                modo = self._queue_flush if interromper else self._queue_add
+                self._tts.speak(texto, modo, None, uid)
+            except Exception as e:
+                print(f"[TTS] Erro ao falar: {e}")
+        else:
+            print(f"[TTS] {texto}")
+
+    def parar(self):
+        if self._tts is not None:
+            try:
+                self._tts.stop()
+            except Exception:
+                pass
+
+
+def carta_para_texto_tts(codigo: str) -> str:
+    if len(codigo) < 2:
+        return codigo
+    valor = NOMES_VALORES_TTS.get(codigo[:-1].upper(), codigo[:-1])
+    naipe = NOMES_NAIPES_TTS.get(codigo[-1].lower(), "")
+    return f"{valor} de {naipe}" if naipe else valor
+
+
+def formatar_acao_para_tts(msg: str) -> str | None:
+    """Filtra eventos de jogo e adapta o texto para pronúncia natural em português."""
+    if not msg:
+        return None
+
+    palavras_chave = (
+        "correu",
+        "passou",
+        "pagou",
+        "aumentou",
+        "ALL-IN",
+        "ganhou",
+        "SHOWDOWN",
+        "Blinds:",
+        "Flop virado",
+        "Turn virado",
+        "River virado",
+        "Rebuy",
+        "conectou",
+        "entrou",
+        "saiu",
+        "desconectou",
+    )
+    if not any(k in msg for k in palavras_chave):
+        return None
+
+    texto = msg
+    for termo in (" (Fold)", " (Check)", " (Call)", " (Raise)"):
+        texto = texto.replace(termo, "")
+    texto = texto.replace("ALL-IN", "all-in").replace("SHOWDOWN!", "Showdown!")
+    texto = texto.replace("(SB ", "(small blind ").replace("(BB ", "(big blind ")
+    texto = re.sub(r"R\$\s*(\d+(?:[.,]\d+)?)", r"\1 reais", texto)
+    return texto
+
+
+def fmt_valor(v: float) -> str:
+    v = round(float(v), 2)
+    return f"{v:.0f}" if v == int(v) else f"{v:.2f}"
+
+
+def _avaliar_5(cinco: tuple[str, ...]) -> tuple[int, list[int]]:
+    valores = sorted([VALORES_MAP[c[0].upper()] for c in cinco], reverse=True)
+    naipes = [c[1].lower() for c in cinco]
+    eh_flush = len(set(naipes)) == 1
+    eh_straight = (valores == list(range(valores[0], valores[0] - 5, -1))) or (
+        valores == [14, 5, 4, 3, 2]
+    )
+    if valores == [14, 5, 4, 3, 2]:
+        valores = [5, 4, 3, 2, 1]
+
+    contagem = sorted([(valores.count(v), v) for v in set(valores)], reverse=True)
+    freq = [p[0] for p in contagem]
+    desempate = [p[1] for p in contagem]
+
+    if eh_straight and eh_flush:
+        return (8, desempate)
+    if freq == [4, 1]:
+        return (7, desempate)
+    if freq == [3, 2]:
+        return (6, desempate)
+    if eh_flush:
+        return (5, desempate)
+    if eh_straight:
+        return (4, desempate)
+    if freq == [3, 1, 1]:
+        return (3, desempate)
+    if freq == [2, 2, 1]:
+        return (2, desempate)
+    if freq == [2, 1, 1, 1]:
+        return (1, desempate)
+    return (0, desempate)
+
+
+def descobrir_combinacao(mao: list[str], mesa: list[str]) -> str:
+    todas = [c for c in (mao + mesa) if len(c) >= 2 and c[0].upper() in VALORES_MAP]
+    if not todas:
+        return "Aguardando cartas..."
+    if len(todas) < 5:
+        valores = [VALORES_MAP[c[0].upper()] for c in todas]
+        cont = sorted([valores.count(v) for v in set(valores)], reverse=True)
+        if cont[0] == 4:
+            return "Quadra"
+        if cont[0] == 3:
+            return "Trinca"
+        if cont[:2] == [2, 2]:
+            return "Dois Pares"
+        if cont[0] == 2:
+            return "Um Par"
+        return "Carta Alta"
+    melhor = max(_avaliar_5(comb) for comb in combinations(todas, 5))
+    return NOMES_COMBINACOES[melhor[0]]
+
+
+def main(page: ft.Page):
+    page.title = "PokerTable"
+    page.theme_mode = ft.ThemeMode.DARK
+    page.padding = 16
+    page.scroll = ft.ScrollMode.AUTO
+
+    tts = AndroidTTS()
+    sock_cliente = None
+    conectado = False
+    ultima_msg_falada = ""
+    cartas_mao_codigos: list[str] = []
+    cartas_mesa_codigos: list[str] = []
+
+    # =========================================================================
+    # TELA 1: CONEXÃO E CADASTRO DO JOGADOR
+    # =========================================================================
+    input_ip = ft.TextField(label="IP do servidor", value="192.168.1.100")
+    input_porta = ft.TextField(
+        label="Porta servidor",
+        value="5000",
+        keyboard_type=ft.KeyboardType.NUMBER,
+    )
+    input_nome = ft.TextField(label="Nome", value="Jogador 1")
+    input_saldo = ft.TextField(
+        label="Saldo Inicial (R$ 200 a R$ 10.000)",
+        value="1000",
+        keyboard_type=ft.KeyboardType.NUMBER,
+    )
+
+    txt_notificacao = ft.Text("", color=ft.Colors.WHITE, weight=ft.FontWeight.BOLD)
+    box_notificacao = ft.Container(
+        content=txt_notificacao,
+        padding=12,
+        bgcolor=ft.Colors.RED_900,
+        border_radius=8,
+        visible=False,
+    )
+
+    def notificar_erro_login(mensagem: str, cor_fundo=ft.Colors.RED_900):
+        txt_notificacao.value = mensagem
+        box_notificacao.bgcolor = cor_fundo
+        box_notificacao.visible = True
+        page.update()
+
+    # =========================================================================
+    # TELA 2: MESA DE POKER E AÇÕES DO JOGADOR
+    # =========================================================================
+    txt_jogador_header = ft.Text("", size=14, color=ft.Colors.GREY_400)
+    txt_papel = ft.Text(
+        "", size=13, weight=ft.FontWeight.BOLD, color=ft.Colors.CYAN_300
+    )
+    txt_fase = ft.Text("Fase: AGUARDANDO", weight=ft.FontWeight.BOLD)
+    txt_saldo = ft.Text(
+        "Saldo: R$ 0", size=16, weight=ft.FontWeight.BOLD, color=ft.Colors.AMBER_300
+    )
+    txt_pote = ft.Text(
+        "Pote: R$ 0", size=16, weight=ft.FontWeight.BOLD, color=ft.Colors.GREEN_300
+    )
+    txt_turno = ft.Text("Vez de: -", size=16, weight=ft.FontWeight.BOLD)
+    txt_combinacao = ft.Text(
+        "Jogo Atual: Aguardando cartas...",
+        size=15,
+        weight=ft.FontWeight.BOLD,
+        color=ft.Colors.CYAN_300,
+    )
+    txt_info = ft.Text("Aguardando o servidor iniciar a partida...", size=14)
+
+    def alternar_audio(_e):
+        tts.ativo = not tts.ativo
+        if not tts.ativo:
+            tts.parar()
+        btn_audio.text = "Áudio: ON" if tts.ativo else "Áudio: OFF"
+        page.update()
+
+    btn_audio = ft.OutlinedButton("Áudio: ON", on_click=alternar_audio)
+
+    row_mao = ft.Row(spacing=10)
+    row_mesa = ft.Row(spacing=8, wrap=True)
+    input_raise = ft.TextField(
+        label="Valor Raise (R$)",
+        value="20",
+        width=140,
+        keyboard_type=ft.KeyboardType.NUMBER,
+    )
+
+    input_rebuy = ft.TextField(
+        label="Valor Rebuy (R$)",
+        value="500",
+        width=150,
+        keyboard_type=ft.KeyboardType.NUMBER,
+    )
+    box_rebuy = ft.Container(
+        visible=False,
+        padding=10,
+        bgcolor=ft.Colors.BLUE_GREY_900,
+        border_radius=8,
+        content=ft.Column(
+            spacing=8,
+            controls=[
+                ft.Text("Adicionar Fichas (Rebuy)", weight=ft.FontWeight.BOLD),
+                ft.Row(
+                    spacing=10,
+                    controls=[
+                        input_rebuy,
+                        ft.Button(
+                            "Fazer Rebuy",
+                            bgcolor=ft.Colors.AMBER_700,
+                            color=ft.Colors.WHITE,
+                            on_click=lambda e: on_rebuy(),
+                        ),
+                    ],
+                ),
+            ],
+        ),
+    )
+
+    # =========================================================================
+    # TELA 3: PLACAR FINAL DA SESSÃO
+    # =========================================================================
+    col_placar_lista = ft.Column(spacing=8)
+
+    def mostrar_tela(qual: str):
+        tela_conexao.visible = qual == "CONEXAO"
+        tela_mesa.visible = qual == "MESA"
+        tela_placar.visible = qual == "PLACAR"
+        page.update()
+
+    def ir_para_tela_mesa(nome: str, saldo: float, ip: str, porta: int):
+        box_notificacao.visible = False
+        txt_jogador_header.value = f"{nome} • {ip}:{porta}"
+        txt_saldo.value = f"Saldo: R$ {fmt_valor(saldo)}"
+        mostrar_tela("MESA")
+
+    def voltar_para_conexao(motivo: str = ""):
+        nonlocal conectado, sock_cliente, ultima_msg_falada
+        conectado = False
+        ultima_msg_falada = ""
+        tts.parar()
+        if sock_cliente:
+            try:
+                sock_cliente.close()
+            except Exception:
+                pass
+            sock_cliente = None
+
+        cartas_mao_codigos.clear()
+        cartas_mesa_codigos.clear()
+        row_mao.controls.clear()
+        row_mesa.controls.clear()
+        col_placar_lista.controls.clear()
+        btn_conectar.disabled = False
+        btn_conectar.content = "Entrar na Mesa"
+        mostrar_tela("CONEXAO")
+        if motivo:
+            notificar_erro_login(motivo)
+
+    def enviar_comando(tipo: str, **dados):
+        if conectado and sock_cliente:
+            try:
+                sock_cliente.sendall(empacotar(tipo, **dados))
+            except Exception as ex:
+                voltar_para_conexao(f"Conexão perdida com o servidor: {ex}")
+
+    def criar_carta_ui(codigo: str):
+        if len(codigo) >= 2:
+            valor_bruto = codigo[:-1]
+            letra_naipe = codigo[-1].lower()
+            valor_exibido = "10" if valor_bruto.upper() == "T" else valor_bruto.upper()
+            icone = ICONES_NAIPE.get(letra_naipe, letra_naipe)
+            texto_carta = f"{valor_exibido} {icone}"
+            cor_texto = (
+                ft.Colors.RED_700 if letra_naipe in ("h", "d") else ft.Colors.BLACK
+            )
+        else:
+            texto_carta = codigo
+            cor_texto = ft.Colors.BLACK
+
+        return ft.Container(
+            content=ft.Text(
+                texto_carta,
+                size=22,
+                weight=ft.FontWeight.BOLD,
+                color=cor_texto,
+            ),
+            padding=12,
+            bgcolor=ft.Colors.WHITE,
+            border_radius=8,
+        )
+
+    def atualizar_combinacao():
+        txt_combinacao.value = f"Jogo Atual: {descobrir_combinacao(cartas_mao_codigos, cartas_mesa_codigos)}"
+
+    def on_estado_mesa(dados: dict):
+        nonlocal ultima_msg_falada
+        fase = dados.get("fase", "-")
+        if fase != "PLACAR_FINAL" and tela_placar.visible:
+            tela_placar.visible = False
+            tela_mesa.visible = True
+
+        txt_fase.value = f"Fase: {fase}"
+        pote = dados.get("pote", 0.0)
+        qtd_side = dados.get("qtd_side_pots", 0)
+        txt_pote.value = (
+            f"Pote: R$ {fmt_valor(pote)} (+{qtd_side} Side)"
+            if qtd_side > 0
+            else f"Pote: R$ {fmt_valor(pote)}"
+        )
+        saldo = dados.get("seu_saldo", 0.0)
+        txt_saldo.value = f"Saldo: R$ {fmt_valor(saldo)}"
+
+        msg = dados.get("msg", "")
+        txt_info.value = msg
+        if msg and msg != ultima_msg_falada:
+            ultima_msg_falada = msg
+            fala = formatar_acao_para_tts(msg)
+            if fala:
+                tts.falar(fala)
+
+        papel = dados.get("papel", "")
+        em_espera = dados.get("em_espera", False)
+        if em_espera:
+            txt_papel.value = "MODO DE ESPERA (entra na próxima rodada)"
+            txt_papel.color = ft.Colors.ORANGE_300
+        elif papel:
+            txt_papel.value = f"Posição: {papel}"
+            txt_papel.color = ft.Colors.CYAN_300
+        else:
+            txt_papel.value = ""
+
+        sua_vez = dados.get("sua_vez", False)
+        a_pagar = dados.get("a_pagar", 0.0)
+        txt_turno.value = (
+            "SUA VEZ DE AGIR!"
+            if sua_vez
+            else f"Vez de: {dados.get('jogador_vez', '-')}"
+        )
+        txt_turno.color = ft.Colors.GREEN_400 if sua_vez else ft.Colors.GREY_400
+
+        btn_fold.disabled = not sua_vez
+        btn_check_call.disabled = not sua_vez
+        btn_raise.disabled = not sua_vez
+        btn_all_in.disabled = not sua_vez or saldo <= 0
+        btn_check_call.content = (
+            f"Pagar R${fmt_valor(a_pagar)}" if a_pagar > 0 else "Passar (Check)"
+        )
+
+        box_rebuy.visible = bool(dados.get("pode_rebuy", False))
+
+    def on_limpar_mesa(_dados: dict):
+        nonlocal ultima_msg_falada
+        ultima_msg_falada = ""
+        cartas_mao_codigos.clear()
+        cartas_mesa_codigos.clear()
+        row_mao.controls.clear()
+        row_mesa.controls.clear()
+        atualizar_combinacao()
+
+    def on_carta_mao(dados: dict):
+        codigo = dados.get("carta", "?")
+        cartas_mao_codigos.append(codigo)
+        row_mao.controls.append(criar_carta_ui(codigo))
+        atualizar_combinacao()
+        tts.falar(f"Sua carta: {carta_para_texto_tts(codigo)}")
+
+    def on_carta_mesa(dados: dict):
+        codigo = dados.get("carta", "?")
+        cartas_mesa_codigos.append(codigo)
+        row_mesa.controls.append(criar_carta_ui(codigo))
+        atualizar_combinacao()
+        tts.falar(f"Carta na mesa: {carta_para_texto_tts(codigo)}")
+
+    def on_placar_final(dados: dict):
+        ranking = dados.get("ranking", [])
+        col_placar_lista.controls.clear()
+
+        for idx, item in enumerate(ranking):
+            lucro = float(item.get("lucro", 0))
+            if lucro > 0:
+                txt_l = f"+R$ {fmt_valor(lucro)}"
+                cor_l = ft.Colors.GREEN_400
+            elif lucro < 0:
+                txt_l = f"-R$ {fmt_valor(abs(lucro))}"
+                cor_l = ft.Colors.RED_400
+            else:
+                txt_l = "R$ 0"
+                cor_l = ft.Colors.GREY_400
+
+            col_placar_lista.controls.append(
+                ft.Container(
+                    padding=12,
+                    bgcolor=ft.Colors.SURFACE_CONTAINER_HIGHEST,
+                    border_radius=8,
+                    content=ft.Row(
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                        controls=[
+                            ft.Column(
+                                spacing=2,
+                                controls=[
+                                    ft.Text(
+                                        f"{idx + 1}º  {item.get('nome', '-')}",
+                                        size=16,
+                                        weight=ft.FontWeight.BOLD,
+                                    ),
+                                    ft.Text(
+                                        f"Investido: R$ {fmt_valor(item.get('total_investido', 0))} • Saldo: R$ {fmt_valor(item.get('saldo_final', 0))}",
+                                        size=12,
+                                        color=ft.Colors.GREY_400,
+                                    ),
+                                ],
+                            ),
+                            ft.Text(
+                                txt_l,
+                                size=16,
+                                weight=ft.FontWeight.BOLD,
+                                color=cor_l,
+                            ),
+                        ],
+                    ),
+                )
+            )
+        mostrar_tela("PLACAR")
+
+    def on_mesa_reiniciada(_dados: dict):
+        on_limpar_mesa({})
+        mostrar_tela("MESA")
+
+    handlers_eventos = {
+        "estado_mesa": on_estado_mesa,
+        "carta_mao": on_carta_mao,
+        "carta_mesa": on_carta_mesa,
+        "limpar_mesa": on_limpar_mesa,
+        "placar_final": on_placar_final,
+        "mesa_reiniciada": on_mesa_reiniciada,
+        "erro": lambda d: setattr(txt_info, "value", f"Aviso: {d.get('msg', '')}"),
+    }
+
+    def escutar_servidor():
+        nonlocal conectado
+        buffer = ""
+        try:
+            while conectado and sock_cliente:
+                dados_brutos = sock_cliente.recv(4096).decode("utf-8")
+                if not dados_brutos:
+                    break
+                buffer += dados_brutos
+                atualizou = False
+                while "\n" in buffer:
+                    linha, buffer = buffer.split("\n", 1)
+                    if not linha.strip():
+                        continue
+                    try:
+                        tipo, dados = desempacotar(linha)
+                        handler = handlers_eventos.get(tipo)
+                        if handler:
+                            handler(dados)
+                            atualizou = True
+                    except Exception as ui_err:
+                        txt_info.value = f"Erro de interface: {ui_err}"
+                        atualizou = True
+                if atualizou:
+                    page.update()
+        except Exception as net_err:
+            if conectado:
+                voltar_para_conexao(f"Desconectado: {net_err}")
+                return
+
+        if conectado:
+            voltar_para_conexao("Servidor encerrou a conexão.")
+
+    def conectar(_e):
+        nonlocal sock_cliente, conectado
+        if conectado:
+            return
+
+        ip = input_ip.value.strip()
+        nome = input_nome.value.strip()
+
+        if not ip or not nome:
+            notificar_erro_login("Preencha o IP do servidor e o seu Nome.")
+            return
+
+        try:
+            porta = int(input_porta.value.strip())
+            if not (1 <= porta <= 65535):
+                raise ValueError
+        except ValueError:
+            notificar_erro_login("Porta inválida. Digite um número entre 1 e 65535.")
+            return
+
+        try:
+            saldo_inicial = float(input_saldo.value.strip().replace(",", "."))
+        except ValueError:
+            notificar_erro_login("Saldo inicial inválido. Digite apenas números.")
+            return
+
+        if saldo_inicial < SALDO_MIN or saldo_inicial > SALDO_MAX:
+            notificar_erro_login(
+                f"Saldo Inicial deve ser entre R$ {fmt_valor(SALDO_MIN)} e R$ {fmt_valor(SALDO_MAX)}."
+            )
+            return
+
+        btn_conectar.disabled = True
+        btn_conectar.content = "Conectando..."
+        box_notificacao.visible = False
+        page.update()
+
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5.0)
+            sock.connect((ip, porta))
+            sock.settimeout(None)
+
+            sock_cliente = sock
+            conectado = True
+
+            enviar_comando("registro", nome=nome, saldo=saldo_inicial)
+            ir_para_tela_mesa(nome, saldo_inicial, ip, porta)
+
+            threading.Thread(target=escutar_servidor, daemon=True).start()
+        except Exception as ex:
+            btn_conectar.disabled = False
+            btn_conectar.content = "Entrar na Mesa"
+            notificar_erro_login(f"Não foi possível conectar em {ip}:{porta} ({ex})")
+
+    def on_raise(_e):
+        try:
+            val = float(input_raise.value.replace(",", "."))
+            enviar_comando("acao", acao="raise", valor=val)
+        except ValueError:
+            txt_info.value = "Digite um número válido para o Raise."
+            page.update()
+
+    def on_rebuy():
+        try:
+            val = float(input_rebuy.value.replace(",", "."))
+            if val < SALDO_MIN or val > SALDO_MAX:
+                txt_info.value = f"Rebuy deve ser entre R$ {fmt_valor(SALDO_MIN)} e R$ {fmt_valor(SALDO_MAX)}."
+                page.update()
+                return
+            enviar_comando("rebuy", valor=val)
+        except ValueError:
+            txt_info.value = "Digite um valor numérico válido para o Rebuy."
+            page.update()
+
+    btn_conectar = ft.Button(
+        "Entrar na Mesa",
+        bgcolor=ft.Colors.GREEN_700,
+        color=ft.Colors.WHITE,
+        height=48,
+        expand=True,
+        on_click=conectar,
+    )
+    btn_sair = ft.OutlinedButton("Sair", on_click=lambda e: voltar_para_conexao())
+    btn_fold = ft.Button(
+        "Correr (Fold)",
+        bgcolor=ft.Colors.RED_800,
+        color=ft.Colors.WHITE,
+        disabled=True,
+        on_click=lambda e: enviar_comando("acao", acao="fold"),
+    )
+    btn_check_call = ft.Button(
+        "Passar (Check)",
+        bgcolor=ft.Colors.BLUE_800,
+        color=ft.Colors.WHITE,
+        disabled=True,
+        on_click=lambda e: enviar_comando(
+            "acao", acao="call" if "Pagar" in str(btn_check_call.content) else "check"
+        ),
+    )
+    btn_raise = ft.Button(
+        "Apostar (Raise)",
+        bgcolor=ft.Colors.GREEN_800,
+        color=ft.Colors.WHITE,
+        disabled=True,
+        on_click=on_raise,
+    )
+    btn_all_in = ft.Button(
+        "All-In",
+        bgcolor=ft.Colors.ORANGE_800,
+        color=ft.Colors.WHITE,
+        disabled=True,
+        on_click=lambda e: enviar_comando("acao", acao="all_in"),
+    )
+
+    tela_conexao = ft.Column(
+        visible=True,
+        spacing=14,
+        controls=[
+            ft.Text("Conectar à Mesa de Poker", size=22, weight=ft.FontWeight.BOLD),
+            input_ip,
+            input_porta,
+            input_nome,
+            input_saldo,
+            box_notificacao,
+            ft.Row([btn_conectar]),
+        ],
+    )
+
+    tela_mesa = ft.Column(
+        visible=False,
+        spacing=10,
+        controls=[
+            ft.Row(
+                [txt_jogador_header, ft.Row([btn_audio, btn_sair], spacing=6)],
+                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+            ),
+            txt_papel,
+            txt_fase,
+            ft.Row(
+                [txt_pote, txt_saldo],
+                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+            ),
+            txt_turno,
+            ft.Container(
+                content=txt_info,
+                padding=10,
+                bgcolor=ft.Colors.SURFACE_CONTAINER_HIGHEST,
+                border_radius=6,
+            ),
+            ft.Text("Suas Cartas Privadas:", weight=ft.FontWeight.BOLD),
+            row_mao,
+            txt_combinacao,
+            ft.Text("Cartas Comunitárias (Mesa):", weight=ft.FontWeight.BOLD),
+            row_mesa,
+            ft.Divider(),
+            ft.Text("Ações:", weight=ft.FontWeight.BOLD),
+            ft.Row([btn_fold, btn_check_call, btn_all_in], spacing=8, wrap=True),
+            ft.Row([input_raise, btn_raise], spacing=10),
+            box_rebuy,
+        ],
+    )
+
+    tela_placar = ft.Column(
+        visible=False,
+        spacing=12,
+        controls=[
+            ft.Row(
+                [
+                    ft.Text("Placar Final da Mesa", size=22, weight=ft.FontWeight.BOLD),
+                    ft.OutlinedButton("Sair", on_click=lambda e: voltar_para_conexao()),
+                ],
+                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+            ),
+            ft.Text(
+                "Aguardando o dealer iniciar uma nova mesa ou desconectar.",
+                size=13,
+                color=ft.Colors.GREY_400,
+            ),
+            col_placar_lista,
+        ],
+    )
+
+    page.add(tela_conexao, tela_mesa, tela_placar)
+
+
+if __name__ == "__main__":
+    ft.run(main)
+

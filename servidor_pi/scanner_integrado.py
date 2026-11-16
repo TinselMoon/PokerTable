@@ -9,12 +9,14 @@ from gpiozero import DigitalInputDevice, DigitalOutputDevice
 # ==============================================================================
 # CONFIGURAÇÕES DE HARDWARE E CALIBRAÇÃO
 # ==============================================================================
-IR_ATIVO_EM_HIGH = False
+# Se no log aparecer "Carta removida" ao colocar a carta, troque para False
+IR_ATIVO_EM_HIGH = True
 
-# Pinos BCM (físicos: 11 -> GPIO 17, 13 -> GPIO 27, 15 -> GPIO 22)
-PINO_LED = 17
-PINO_VCC_IR = 27
-PINO_DO_IR = 22
+# Pinos BCM livres fora do bloco 1-26 do LCD 3.5"
+# (físicos: 37 -> GPIO 26, 35 -> GPIO 19, 33 -> GPIO 13)
+PINO_LED = 26
+PINO_VCC_IR = 19
+PINO_DO_IR = 13
 
 TEMPO_ESTABILIZACAO = 0.40
 VOTOS_NECESSARIOS = 7
@@ -75,7 +77,9 @@ class HardwareScanner:
                 pino_do_ir, pull_up=None, active_state=ativo_high
             )
             self.ativo = True
-            log("Hardware GPIO inicializado (LED, VCC IR e DO IR).")
+            log(
+                f"Hardware GPIO inicializado (LED={pino_led}, VCC_IR={pino_vcc_ir}, DO_IR={pino_do_ir}, active_high={ativo_high})."
+            )
         except Exception as e:
             log(f"Hardware GPIO indisponível ({e}); operando em fallback.")
 
@@ -83,7 +87,7 @@ class HardwareScanner:
         if self.ativo:
             self.led.on()
             self.vcc_ir.on()
-            time.sleep(0.05)
+            time.sleep(0.10)
 
     def desligar(self) -> None:
         if self.ativo:
@@ -109,15 +113,11 @@ def orientar(bruto):
     return cv2.flip(girado, 1)
 
 
-def calcular_hog(img):
-    hog = cv2.HOGDescriptor((32, 32), (16, 16), (8, 8), (8, 8), 9)
-    return hog.compute(img).reshape(1, -1)
-
-
 def extrair_simbolo(recorte):
     cinza = cv2.cvtColor(recorte, cv2.COLOR_BGR2GRAY)
-    if cv2.mean(cinza)[0] < LIMIAR_PRESENCA:
-        return None
+    brilho = cv2.mean(cinza)[0]
+    if brilho < LIMIAR_PRESENCA:
+        return None, brilho
 
     cinza_blur = cv2.GaussianBlur(cinza, (3, 3), 0)
     _, binaria = cv2.threshold(
@@ -142,7 +142,7 @@ def extrair_simbolo(recorte):
         achou = True
 
     if not achou:
-        return None
+        return None, brilho
 
     tinta = binaria[y_min:y_max, x_min:x_max]
     lado_sq = max(tinta.shape[1], tinta.shape[0])
@@ -160,7 +160,7 @@ def extrair_simbolo(recorte):
     media_bgr = cv2.mean(recorte_roi, mask=mascara)
     vermelho = (media_bgr[2] - 0.5 * (media_bgr[0] + media_bgr[1])) > LIMIAR_VERMELHO
 
-    return img_redim, vermelho
+    return (img_redim, vermelho), brilho
 
 
 def prever(modelo, nomes, img) -> str:
@@ -216,6 +216,7 @@ def main():
     evento("PRONTO")
 
     cap = None
+    hw_ligado = False
     estado_ir_anterior = None
     momento_deteccao_ir = 0.0
     candidata_atual = None
@@ -223,6 +224,8 @@ def main():
     votos_duplicada = 0
     carta_confirmada = False
     duplicada_notificada = None
+    salvou_debug_carta = False
+    ultimo_log_debug = 0.0
 
     rx, ry, rw, rh = ROI_NUMERO
     nx, ny, nw, nh = ROI_NAIPE
@@ -246,39 +249,50 @@ def main():
                 votos_duplicada = 0
                 carta_confirmada = False
                 duplicada_notificada = None
+                salvou_debug_carta = False
 
-            if quer_camera and cap is None:
-                try:
-                    from picamera2 import Picamera2
-
-                    cap = Picamera2()
-                    cap.configure(
-                        cap.create_video_configuration(
-                            main={"size": (640, 480), "format": "RGB888"}
-                        )
-                    )
-                    cap.start()
-                    time.sleep(1.0)
+            if quer_camera:
+                if not hw_ligado:
                     hw.ligar()
-
+                    hw_ligado = True
                     estado_ir_anterior = None
                     candidata_atual = None
                     votos = 0
                     votos_duplicada = 0
                     carta_confirmada = False
                     duplicada_notificada = None
-                    evento("CAMERA_LIGADA")
-                except Exception as e:
-                    log(f"Falha ao ligar câmera: {e}")
-                    evento(f"ERRO;Falha ao ligar câmera: {e}")
-                    with lock_estado:
-                        estado["quer_camera"] = False
-                    time.sleep(0.5)
-                    continue
+                    salvou_debug_carta = False
 
-            elif not quer_camera:
-                if estado_ir_anterior is not None:
+                    if cap is None:
+                        try:
+                            from picamera2 import Picamera2
+
+                            cap = Picamera2()
+                            cap.configure(
+                                cap.create_video_configuration(
+                                    main={"size": (640, 480), "format": "RGB888"}
+                                )
+                            )
+                            cap.start()
+                            time.sleep(1.0)
+                        except Exception as e:
+                            hw.desligar()
+                            hw_ligado = False
+                            log(f"Falha ao ligar câmera: {e}")
+                            evento(f"ERRO;Falha ao ligar câmera: {e}")
+                            with lock_estado:
+                                estado["quer_camera"] = False
+                            time.sleep(0.5)
+                            continue
+                    else:
+                        time.sleep(0.4)
+
+                    evento("CAMERA_LIGADA")
+
+            else:
+                if hw_ligado:
                     hw.desligar()
+                    hw_ligado = False
                     estado_ir_anterior = None
                     candidata_atual = None
                     votos = 0
@@ -308,6 +322,7 @@ def main():
                 votos_duplicada = 0
                 carta_confirmada = False
                 duplicada_notificada = None
+                salvou_debug_carta = False
                 estado_ir_anterior = carta_presente
 
             if not carta_presente or carta_confirmada:
@@ -329,8 +344,8 @@ def main():
             rec_num = frame[ry : ry + rh, rx : rx + rw]
             rec_nai = frame[ny : ny + nh, nx : nx + nw]
 
-            res_v = extrair_simbolo(rec_num)
-            res_n = extrair_simbolo(rec_nai)
+            res_v, brilho_v = extrair_simbolo(rec_num)
+            res_n, brilho_n = extrair_simbolo(rec_nai)
 
             valor = (
                 prever(svm_valores, NOMES_VALORES, res_v[0])
@@ -346,12 +361,34 @@ def main():
                     else prever(svm_pretos, NOMES_NAIPES_PRETOS, img_n)
                 )
 
+            if not salvou_debug_carta:
+                debug_img = frame.copy()
+                cv2.rectangle(debug_img, (rx, ry), (rx + rw, ry + rh), (255, 0, 0), 2)
+                cv2.rectangle(debug_img, (nx, ny), (nx + nw, ny + nh), (0, 0, 255), 2)
+                cv2.putText(
+                    debug_img,
+                    f"{valor} de {naipe} | B:{brilho_v:.0f}/{brilho_n:.0f}",
+                    (12, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 255, 0),
+                    2,
+                )
+                cv2.imwrite("/tmp/debug_scanner.jpg", debug_img)
+                salvou_debug_carta = True
+
+            agora = time.monotonic()
+            if (agora - ultimo_log_debug) >= 0.6:
+                log(
+                    f"[DEBUG] Leitura={valor} de {naipe} | votos={votos}/{VOTOS_NECESSARIOS} | "
+                    f"brilho_num={brilho_v:.1f} brilho_naipe={brilho_n:.1f}"
+                )
+                ultimo_log_debug = agora
+
             if valor != "?" and naipe != "?":
                 codigo = traduzir_codigo(valor, naipe)
                 leitura = (valor, naipe)
 
-                # Bloqueio inteligente de carta já usada na rodada:
-                # descarta falso positivo momentâneo; só avisa duplicata se persistir
                 if codigo in cartas_usadas:
                     votos = 0
                     if leitura == candidata_atual:
