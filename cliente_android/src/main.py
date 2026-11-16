@@ -6,6 +6,13 @@ from protocolo import empacotar, desempacotar
 SALDO_MIN = 200.0
 SALDO_MAX = 10000.0
 
+ICONES_NAIPE = {
+    "s": "♠",
+    "h": "♥",
+    "d": "♦",
+    "c": "♣",
+}
+
 
 def main(page: ft.Page):
     page.title = "PokerTable"
@@ -30,6 +37,10 @@ def main(page: ft.Page):
         label="Saldo Inicial (R$ 200 a R$ 10.000)",
         value="1000",
         keyboard_type=ft.KeyboardType.NUMBER,
+    )
+    switch_testes = ft.Switch(
+        label="Modo Testes (Jogar sozinho)",
+        value=False,
     )
 
     txt_notificacao = ft.Text("", color=ft.Colors.WHITE, weight=ft.FontWeight.BOLD)
@@ -72,7 +83,8 @@ def main(page: ft.Page):
 
     def ir_para_tela_mesa(nome: str, saldo: float, ip: str, porta: int):
         box_notificacao.visible = False
-        txt_jogador_header.value = f"{nome} • Conectado em {ip}:{porta}"
+        tag_teste = " [TESTES]" if switch_testes.value else ""
+        txt_jogador_header.value = f"{nome}{tag_teste} • {ip}:{porta}"
         txt_saldo.value = f"Saldo: R$ {saldo:.0f}"
         tela_conexao.visible = False
         tela_mesa.visible = True
@@ -106,11 +118,31 @@ def main(page: ft.Page):
             except Exception as ex:
                 voltar_para_conexao(f"Conexão perdida com o servidor: {ex}")
 
-    def criar_carta_ui(codigo: str, cor: str):
+    def criar_carta_ui(codigo: str, cor_borda: str):
+        """Converte '8c' -> '8 ♣' e 'Th' -> '10 ♥' com visual de carta."""
+        if len(codigo) >= 2:
+            valor_bruto = codigo[:-1]
+            letra_naipe = codigo[-1].lower()
+            valor_exibido = "10" if valor_bruto == "T" else valor_bruto
+            icone = ICONES_NAIPE.get(letra_naipe, letra_naipe)
+            texto_carta = f"{valor_exibido} {icone}"
+            cor_texto = (
+                ft.Colors.RED_700 if letra_naipe in ("h", "d") else ft.Colors.BLACK
+            )
+        else:
+            texto_carta = codigo
+            cor_texto = ft.Colors.BLACK
+
         return ft.Container(
-            content=ft.Text(codigo, size=22, weight=ft.FontWeight.BOLD),
-            padding=ft.Padding.symmetric(horizontal=14, vertical=10),
-            bgcolor=cor,
+            content=ft.Text(
+                texto_carta,
+                size=22,
+                weight=ft.FontWeight.BOLD,
+                color=cor_texto,
+            ),
+            padding=ft.Padding.symmetric(horizontal=14, vertical=12),
+            bgcolor=ft.Colors.WHITE,
+            border=ft.Border.all(2, cor_borda),
             border_radius=8,
         )
 
@@ -143,10 +175,10 @@ def main(page: ft.Page):
     handlers_eventos = {
         "estado_mesa": on_estado_mesa,
         "carta_mao": lambda d: row_mao.controls.append(
-            criar_carta_ui(d.get("carta", "?"), ft.Colors.BLUE_900)
+            criar_carta_ui(d.get("carta", "?"), ft.Colors.BLUE_400)
         ),
         "carta_mesa": lambda d: row_mesa.controls.append(
-            criar_carta_ui(d.get("carta", "?"), ft.Colors.GREEN_900)
+            criar_carta_ui(d.get("carta", "?"), ft.Colors.GREEN_400)
         ),
         "nova_rodada": on_nova_rodada,
         "erro": lambda d: setattr(txt_info, "value", f"Aviso: {d.get('msg', '')}"),
@@ -173,7 +205,7 @@ def main(page: ft.Page):
             pass
 
         if conectado:
-            voltar_para_conexao("Desconectado do servidor.")
+            voltar_para_conexao(f"Desconectado: {e}")
 
     def conectar(e):
         nonlocal sock_cliente, conectado
@@ -221,7 +253,12 @@ def main(page: ft.Page):
             sock_cliente = sock
             conectado = True
 
-            enviar_comando("registro", nome=nome, saldo=saldo_inicial)
+            enviar_comando(
+                "registro",
+                nome=nome,
+                saldo=saldo_inicial,
+                modo_testes=switch_testes.value,
+            )
             ir_para_tela_mesa(nome, saldo_inicial, ip, porta)
 
             threading.Thread(target=escutar_servidor, daemon=True).start()
@@ -251,7 +288,9 @@ def main(page: ft.Page):
     # Botões Tela 2
     btn_nova_rodada = ft.OutlinedButton(
         "Nova Rodada",
-        on_click=lambda e: enviar_comando("iniciar_rodada"),
+        on_click=lambda e: enviar_comando(
+            "iniciar_rodada", modo_testes=switch_testes.value
+        ),
     )
     btn_sair = ft.OutlinedButton(
         "Sair",
@@ -291,6 +330,7 @@ def main(page: ft.Page):
             input_porta,
             input_nome,
             input_saldo,
+            switch_testes,
             box_notificacao,
             ft.Row([btn_conectar]),
         ],
