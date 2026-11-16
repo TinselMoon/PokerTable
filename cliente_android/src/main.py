@@ -39,7 +39,7 @@ def main(page: ft.Page):
         keyboard_type=ft.KeyboardType.NUMBER,
     )
     switch_testes = ft.Switch(
-        label="Modo Testes (Jogar sozinho)",
+        label="Modo Testes (Jogar contra Robô)",
         value=False,
     )
 
@@ -83,7 +83,7 @@ def main(page: ft.Page):
 
     def ir_para_tela_mesa(nome: str, saldo: float, ip: str, porta: int):
         box_notificacao.visible = False
-        tag_teste = " [TESTES]" if switch_testes.value else ""
+        tag_teste = " [VS ROBÔ]" if switch_testes.value else ""
         txt_jogador_header.value = f"{nome}{tag_teste} • {ip}:{porta}"
         txt_saldo.value = f"Saldo: R$ {saldo:.0f}"
         tela_conexao.visible = False
@@ -118,8 +118,8 @@ def main(page: ft.Page):
             except Exception as ex:
                 voltar_para_conexao(f"Conexão perdida com o servidor: {ex}")
 
-    def criar_carta_ui(codigo: str, cor_borda: str):
-        """Converte '8c' -> '8 ♣' e 'Th' -> '10 ♥' com visual de carta."""
+    def criar_carta_ui(codigo: str):
+        """Converte '8c' -> '8 ♣' e 'Th' -> '10 ♥' em carta branca com naipe colorido."""
         if len(codigo) >= 2:
             valor_bruto = codigo[:-1]
             letra_naipe = codigo[-1].lower()
@@ -142,7 +142,6 @@ def main(page: ft.Page):
             ),
             padding=ft.Padding.symmetric(horizontal=14, vertical=12),
             bgcolor=ft.Colors.WHITE,
-            border=ft.Border.all(2, cor_borda),
             border_radius=8,
         )
 
@@ -175,10 +174,10 @@ def main(page: ft.Page):
     handlers_eventos = {
         "estado_mesa": on_estado_mesa,
         "carta_mao": lambda d: row_mao.controls.append(
-            criar_carta_ui(d.get("carta", "?"), ft.Colors.BLUE_400)
+            criar_carta_ui(d.get("carta", "?"))
         ),
         "carta_mesa": lambda d: row_mesa.controls.append(
-            criar_carta_ui(d.get("carta", "?"), ft.Colors.GREEN_400)
+            criar_carta_ui(d.get("carta", "?"))
         ),
         "nova_rodada": on_nova_rodada,
         "erro": lambda d: setattr(txt_info, "value", f"Aviso: {d.get('msg', '')}"),
@@ -195,17 +194,24 @@ def main(page: ft.Page):
                 buffer += dados_brutos
                 while "\n" in buffer:
                     linha, buffer = buffer.split("\n", 1)
-                    if linha.strip():
+                    if not linha.strip():
+                        continue
+                    try:
                         tipo, dados = desempacotar(linha)
                         handler = handlers_eventos.get(tipo)
                         if handler:
                             handler(dados)
                             page.update()
-        except Exception:
-            pass
+                    except Exception as ui_err:
+                        txt_info.value = f"Erro ao renderizar pacote: {ui_err}"
+                        page.update()
+        except Exception as net_err:
+            if conectado:
+                voltar_para_conexao(f"Desconectado: {net_err}")
+                return
 
         if conectado:
-            voltar_para_conexao(f"Desconectado: {e}")
+            voltar_para_conexao("Servidor encerrou a conexão.")
 
     def conectar(e):
         nonlocal sock_cliente, conectado
@@ -275,7 +281,6 @@ def main(page: ft.Page):
             txt_info.value = "Digite um número válido para o Raise."
             page.update()
 
-    # Botões Tela 1
     btn_conectar = ft.Button(
         "Entrar na Mesa",
         bgcolor=ft.Colors.GREEN_700,
@@ -284,8 +289,6 @@ def main(page: ft.Page):
         expand=True,
         on_click=conectar,
     )
-
-    # Botões Tela 2
     btn_nova_rodada = ft.OutlinedButton(
         "Nova Rodada",
         on_click=lambda e: enviar_comando(
@@ -320,7 +323,6 @@ def main(page: ft.Page):
         on_click=on_raise,
     )
 
-    # Montagem das duas telas
     tela_conexao = ft.Column(
         visible=True,
         spacing=14,
