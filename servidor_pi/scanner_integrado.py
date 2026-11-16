@@ -10,7 +10,7 @@ from gpiozero import DigitalInputDevice, DigitalOutputDevice
 # CONFIGURAÇÕES DE HARDWARE E CALIBRAÇÃO
 # ==============================================================================
 # Se no log aparecer "Carta removida" ao colocar a carta, troque para False
-IR_ATIVO_EM_HIGH = True
+IR_ATIVO_EM_HIGH = False
 
 # Pinos BCM livres fora do bloco 1-26 do LCD 3.5"
 # (físicos: 37 -> GPIO 26, 35 -> GPIO 19, 33 -> GPIO 13)
