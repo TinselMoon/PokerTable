@@ -1,15 +1,16 @@
 import sys
 import threading
 import time
+from pathlib import Path
 import cv2
 import numpy as np
-from pathlib import Path
+from gpiozero import DigitalInputDevice, DigitalOutputDevice
 
 # Configurações de ROI (x, y, largura, altura) para recortes no frame já orientado
 ROI_NUMERO = (179, 250, 79, 101)
 ROI_NAIPE = (179, 352, 82, 86)
 
-LIMIAR_PRESENCA = 120.0  # Teste aumentar de 50.0 para 100.0 ou 120.0
+LIMIAR_PRESENCA = 120.0
 LIMIAR_VERMELHO = 30.0
 AREA_MIN = 15.0
 LADO = 32
@@ -18,57 +19,64 @@ NOMES_VALORES = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K
 NOMES_NAIPES_VERMELHOS = ["Copas", "Ouros"]
 NOMES_NAIPES_PRETOS = ["Espadas", "Paus"]
 
-# Estado global compartilhado com a thread de comandos
 estado = {"quer_camera": False, "rodando": True}
 
 
 def log(msg):
-    # Logs para debug vão para o STDERR para não sujar o STDOUT que é usado no IPC
     print(msg, file=sys.stderr, flush=True)
 
 
 def evento(msg):
-    # Eventos de IPC vão para o STDOUT
     print(msg, flush=True)
 
 
-class Led:
-    def __init__(self, pino):
-        self.pino = pino
+class HardwareScanner:
+    def __init__(self, pino_led=17, pino_vcc_ir=27, pino_do_ir=22):
+        self.ativo = False
         try:
-            import gpiod
-
-            self.chip = gpiod.Chip("gpiochip0")
-            self.linha = self.chip.get_line(pino)
-            self.linha.request(consumer="scanner", type=gpiod.LINE_REQ_DIR_OUT)
+            self.led = DigitalOutputDevice(pino_led, initial_value=False)
+            self.vcc_ir = DigitalOutputDevice(pino_vcc_ir, initial_value=False)
+            self.sensor_ir = DigitalInputDevice(pino_do_ir, pull_up=True)
             self.ativo = True
         except Exception as e:
-            self.ativo = False
-            log(f"LED indisponível ({e}); seguindo sem controle de iluminação.")
+            log(f"Hardware GPIO indisponível ({e}); seguindo sem LED/IR.")
 
     def ligar(self):
         if self.ativo:
-            self.linha.set_value(1)
+            self.led.on()
+            self.vcc_ir.on()
+            time.sleep(0.05)  # Estabiliza o sensor IR
 
     def desligar(self):
         if self.ativo:
-            self.linha.set_value(0)
+            self.led.off()
+            self.vcc_ir.off()
+
+    @property
+    def carta_no_sensor(self) -> bool:
+        if not self.ativo:
+            return True  # Fallback caso rode sem GPIO conectado
+        return not self.sensor_ir.is_active
+
+    def fechar(self):
+        if self.ativo:
+            self.desligar()
+            self.led.close()
+            self.vcc_ir.close()
+            self.sensor_ir.close()
 
 
 def orientar(bruto):
-    # Rotaciona 90 graus anti-horário e espelha horizontalmente (equivalente ao main.cpp)
     girado = cv2.rotate(bruto, cv2.ROTATE_90_COUNTERCLOCKWISE)
     return cv2.flip(girado, 1)
 
 
 def calcular_hog(img):
-    # Extração de características (mesmos parâmetros do C++)
     hog = cv2.HOGDescriptor((32, 32), (16, 16), (8, 8), (8, 8), 9)
     return hog.compute(img).reshape(1, -1)
 
 
 def extrair_simbolo(recorte):
-    # Implementação baseada no 'simbolo.hpp'
     cinza = cv2.cvtColor(recorte, cv2.COLOR_BGR2GRAY)
     if cv2.mean(cinza)[0] < LIMIAR_PRESENCA:
         return None
@@ -80,7 +88,7 @@ def extrair_simbolo(recorte):
 
     contornos, _ = cv2.findContours(binaria, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    area_max = 0.5 * recorte.size / 3  # recorte.size é o total de pixels por canal
+    area_max = 0.5 * recorte.size / 3
     x_min, y_min, x_max, y_max = 9999, 9999, -1, -1
     achou = False
 
@@ -109,18 +117,12 @@ def extrair_simbolo(recorte):
 
     img_redim = cv2.resize(quadrado, (LADO, LADO), interpolation=cv2.INTER_AREA)
 
-    # Análise de cor da tinta (Verificação se é vermelho)
     mascara = binaria[y_min:y_max, x_min:x_max]
     recorte_roi = recorte[y_min:y_max, x_min:x_max]
     media_bgr = cv2.mean(recorte_roi, mask=mascara)
     vermelho = (media_bgr[2] - 0.5 * (media_bgr[0] + media_bgr[1])) > LIMIAR_VERMELHO
 
     return img_redim, vermelho
-
-
-def ha_carta(recorte):
-    cinza = cv2.cvtColor(recorte, cv2.COLOR_BGR2GRAY)
-    return cv2.mean(cinza)[0] >= LIMIAR_PRESENCA
 
 
 def prever(modelo, nomes, img):
@@ -131,7 +133,6 @@ def prever(modelo, nomes, img):
 
 
 def ler_comandos():
-    # Loop bloqueante para escutar comandos do aplicativo pai no STDIN
     for linha in sys.stdin:
         cmd = linha.strip()
         if cmd == "LIGAR":
@@ -146,27 +147,21 @@ def ler_comandos():
 
 
 def main():
-    BASE_DIR = Path(__file__).resolve().parent
-    PASTA_MODELOS = BASE_DIR / "modelos"
-
+    pasta_modelos = Path(__file__).resolve().parent / "modelos"
     try:
-        svm_valores = cv2.ml.SVM_load(str(PASTA_MODELOS / "modelo_valores.xml"))
+        svm_valores = cv2.ml.SVM_load(str(pasta_modelos / "modelo_valores.xml"))
         svm_vermelhos = cv2.ml.SVM_load(
-            str(PASTA_MODELOS / "modelo_naipes_vermelhos.xml")
+            str(pasta_modelos / "modelo_naipes_vermelhos.xml")
         )
-        svm_pretos = cv2.ml.SVM_load(str(PASTA_MODELOS / "modelo_naipes_pretos.xml"))
-
+        svm_pretos = cv2.ml.SVM_load(str(pasta_modelos / "modelo_naipes_pretos.xml"))
         if svm_valores.empty() or svm_vermelhos.empty() or svm_pretos.empty():
-            raise FileNotFoundError(
-                "Um ou mais arquivos XML não foram encontrados ou estão vazios."
-            )
+            raise FileNotFoundError("Arquivo XML vazio ou não encontrado.")
     except Exception as e:
-        evento(f"ERRO;Falha ao carregar modelos XML em {PASTA_MODELOS}: {e}")
+        evento(f"ERRO;Falha ao carregar modelos XML: {e}")
         return 1
 
-    led = Led(17)
+    hw = HardwareScanner(pino_led=17, pino_vcc_ir=27, pino_do_ir=22)
 
-    # Inicia a thread que escuta comandos
     threading.Thread(target=ler_comandos, daemon=True).start()
     evento("PRONTO")
 
@@ -177,7 +172,6 @@ def main():
 
     try:
         while estado["rodando"]:
-            # Controle de estado da câmera para o CABO FLAT (CSI) via picamera2
             if estado["quer_camera"] and cap is None:
                 from picamera2 import Picamera2
 
@@ -188,8 +182,8 @@ def main():
                     )
                 )
                 cap.start()
-                time.sleep(1.0)  # Tempo vital para a lente ajustar foco e exposição
-                led.ligar()
+                time.sleep(1.0)
+                hw.ligar()
                 carta_em_leitura, ultima, repeticoes = False, None, 0
                 evento("CAMERA_LIGADA")
 
@@ -197,18 +191,31 @@ def main():
                 cap.stop()
                 cap.close()
                 cap = None
-                led.desligar()
+                hw.desligar()
                 evento("CAMERA_DESLIGADA")
 
             if cap is None:
                 time.sleep(0.1)
                 continue
 
-            # Captura de frame específica da biblioteca picamera2
+            # 1. Verifica primeiro o sensor infravermelho físico
+            if not hw.carta_no_sensor:
+                if carta_em_leitura:
+                    evento("CARTA_REMOVIDA")
+                carta_em_leitura, ultima, repeticoes = False, None, 0
+                time.sleep(0.05)
+                continue
+
+            # 2. Se já leu essa carta e ela continua parada no IR, aguarda ser retirada
+            if carta_em_leitura:
+                time.sleep(0.05)
+                continue
+
+            # 3. Carta presente no IR: captura frame e classifica
             try:
                 bruto = cap.capture_array("main")
             except Exception as e:
-                log(f"ERRO: Falha ao capturar frame da câmera plana: {e}")
+                log(f"ERRO: Falha ao capturar frame: {e}")
                 time.sleep(0.1)
                 continue
 
@@ -218,47 +225,36 @@ def main():
             rec_num = frame[ry : ry + rh, rx : rx + rw]
             rec_nai = frame[ny : ny + nh, nx : nx + nw]
 
-            if carta_em_leitura:
-                if not ha_carta(rec_num) or not ha_carta(rec_nai):
-                    evento("CARTA_REMOVIDA")
-                    carta_em_leitura, ultima, repeticoes = False, None, 0
+            res_v = extrair_simbolo(rec_num)
+            res_n = extrair_simbolo(rec_nai)
+            valor = naipe = ""
+
+            if res_v is not None:
+                valor = prever(svm_valores, NOMES_VALORES, res_v[0])
+            if res_n is not None:
+                img_n, is_red = res_n
+                naipe = (
+                    prever(svm_vermelhos, NOMES_NAIPES_VERMELHOS, img_n)
+                    if is_red
+                    else prever(svm_pretos, NOMES_NAIPES_PRETOS, img_n)
+                )
+
+            if valor and naipe and valor != "?" and naipe != "?":
+                leitura = (valor, naipe)
+                repeticoes = repeticoes + 1 if leitura == ultima else 1
+                ultima = leitura
+                if repeticoes >= VOTOS_NECESSARIOS:
+                    evento(f"CARTA;{valor};{naipe}")
+                    carta_em_leitura = True
             else:
-                res_v = extrair_simbolo(rec_num)
-                res_n = extrair_simbolo(rec_nai)
-                valor = naipe = ""
+                ultima, repeticoes = None, 0
 
-                if res_v is not None:
-                    valor = prever(svm_valores, NOMES_VALORES, res_v[0])
-                if res_n is not None:
-                    img_n, is_red = res_n
-                    naipe = (
-                        prever(svm_vermelhos, NOMES_NAIPES_VERMELHOS, img_n)
-                        if is_red
-                        else prever(svm_pretos, NOMES_NAIPES_PRETOS, img_n)
-                    )
-
-                if valor and naipe and valor != "?" and naipe != "?":
-                    leitura = (valor, naipe)
-                    repeticoes = repeticoes + 1 if leitura == ultima else 1
-                    ultima = leitura
-                    if repeticoes >= VOTOS_NECESSARIOS:
-                        evento(f"CARTA;{valor};{naipe}")
-                        carta_em_leitura = True
-                else:
-                    ultima, repeticoes = None, 0
-
-            # Janela de Raio-X para centralização da carta
-            # cv2.rectangle(frame, (rx, ry), (rx + rw, ry + rh), (255, 0, 0), 2)
-            # cv2.rectangle(frame, (nx, ny), (nx + nw, ny + nh), (0, 0, 255), 2)
-            # cv2.imshow("Raio-X do Scanner", frame)
-            # cv2.waitKey(1)
-
-            time.sleep(0.1)
+            time.sleep(0.05)
     finally:
         if cap is not None:
             cap.stop()
             cap.close()
-        led.desligar()
+        hw.fechar()
 
 
 if __name__ == "__main__":
