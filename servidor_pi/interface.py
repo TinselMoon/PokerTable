@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import queue
 import subprocess
+import sys
 import tkinter as tk
 
 from regras_de_negocio import fmt_valor
@@ -118,6 +119,15 @@ class InterfacePokerLCD:
 
         self._renderizar_estado()
         self._processar_fila_ui()
+
+        modo_mouse = "--mouse" in sys.argv
+        self.root.title("PokerTable Central")
+        if modo_mouse:
+            self.root.geometry(f"{LARGURA}x{ALTURA}+80+80")
+            self.root.configure(bg=COR_BG, cursor="arrow")
+        else:
+            self.root.geometry(f"{LARGURA}x{ALTURA}+0+0")
+            self.root.configure(bg=COR_BG, cursor="none")
 
     # =========================================================================
     # HEADER GLOBAL (PRESENTE EM TODAS AS TELAS COM BOTÃO DE DESLIGAR)
